@@ -366,33 +366,69 @@ pub enum Mark {
 pub struct PlanPage {
     pub items: Vec<PlanItem>,
     pub marks: Vec<Mark>,
+    /// Page size in mm and the sheet it belongs to ("Kitchen" / "Tables").
+    pub w: f32,
+    pub h: f32,
+    pub sheet: &'static str,
 }
 
 #[derive(Debug)]
 pub struct PlanLayout {
+    /// Orientation of the first (Kitchen) page; each page carries its own size.
     pub landscape: bool,
     pub w: f32,
     pub h: f32,
     pub pages: Vec<PlanPage>,
     pub matrix_included: bool,
+    /// E.g. "Tables sheet needs 2 pages even at 6 pt".
+    pub warnings: Vec<String>,
+    /// Body font size reached by each sheet (pt).
+    pub kitchen_pt: f32,
+    pub tables_pt: f32,
 }
 
 const MARGIN: f32 = 10.0;
 /// Content starts below the one-line page header.
-const TOP: f32 = 18.0;
+const TOP: f32 = 17.0;
 /// Content ends this far above the page bottom (footer line), plus `KEY_ROOM` on page 1 when the key is shown.
 const BOTTOM: f32 = 9.5;
 const KEY_ROOM: f32 = 5.5;
 const PT: f32 = 0.352_778;
-/// Font sizes (pt): nothing in the plan is larger than 12 pt.
-const BODY: f32 = 9.0;
-const HEAD: f32 = 9.0; // column headers (bold)
-const SUB: f32 = 10.0; // table sub-headings (bold)
-const SECTION: f32 = 11.0; // section headings (bold)
-const PAD: f32 = 0.8;
-const GAP: f32 = 2.0;
-const MAX_LINES: usize = 3;
-const DIET_LINES: usize = 6;
+/// Body text is 9 pt at full size and shrinks to a 6 pt floor; headings scale with it and stay <= 12 pt.
+pub const BODY_MAX_PT: f32 = 9.0;
+pub const BODY_MIN_PT: f32 = 6.0;
+const GUTTER: f32 = 4.0;
+const MAX_LINES: usize = 4;
+const DIET_LINES: usize = 40;
+
+thread_local! {
+    static SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+fn scale() -> f32 {
+    SCALE.with(|c| c.get())
+}
+fn body() -> f32 {
+    BODY_MAX_PT * scale()
+}
+fn head() -> f32 {
+    9.0 * scale()
+}
+fn sub() -> f32 {
+    9.0 * scale()
+}
+fn section() -> f32 {
+    11.0 * scale()
+}
+/// Horizontal padding inside table cells (a little wider than the vertical padding).
+fn hpad() -> f32 {
+    1.0 * scale()
+}
+fn pad() -> f32 {
+    0.3 * scale()
+}
+fn gap() -> f32 {
+    2.0 * scale()
+}
 
 /// Width in mm of `text` in Helvetica(-Bold), covering the few non-ASCII symbols we emit.
 fn tw(text: &str, size: f32, bold: bool) -> f32 {
@@ -437,7 +473,16 @@ pub fn wrap(text: &str, size: f32, bold: bool, max_w: f32, max_lines: usize) -> 
                 }
                 continue;
             }
-            // A single word wider than the cell: split it by characters.
+            // A single word wider than the cell: split it after a hyphen if possible, else by characters.
+            if let Some(cut) = word.char_indices().filter(|(_, c)| *c == '-').map(|(i, _)| i + 1).filter(|i| *i < word.len() && tw(&word[..*i], size, bold) <= max_w).last() {
+                lines.push(word[..cut].to_string());
+                word = word[cut..].to_string();
+                if lines.len() == max_lines && !word.is_empty() {
+                    overflow = true;
+                    break 'outer;
+                }
+                continue;
+            }
             let mut head = String::new();
             let mut rest = word.chars().peekable();
             while let Some(&c) = rest.peek() {
@@ -474,41 +519,112 @@ pub fn wrap(text: &str, size: f32, bold: bool, max_w: f32, max_lines: usize) -> 
 }
 
 struct Flow {
+    w: f32,
     h: f32,
     pages: Vec<PlanPage>,
     y: f32,
     /// Reserve room at the bottom of page 1 for the allergy-marker key.
     key: bool,
-    /// Whether the current page already shows the table column header row.
+    /// Whether the current column already shows the table column header row.
     header_on_page: bool,
+    /// Newspaper columns of the current zone: how many, the current one and its width.
+    ncols: usize,
+    col: usize,
+    col_w: f32,
+    zone_top: f32,
+    zone_bottom: Option<f32>,
+    max_y: f32,
+    sheet: &'static str,
 }
 
 impl Flow {
-    fn new(h: f32, key: bool) -> Self {
-        Flow { h, pages: vec![PlanPage::default()], y: TOP, key, header_on_page: false }
+    fn new(w: f32, h: f32, key: bool, sheet: &'static str) -> Self {
+        Flow {
+            w,
+            h,
+            pages: vec![PlanPage { w, h, sheet, ..Default::default() }],
+            y: TOP,
+            key,
+            header_on_page: false,
+            ncols: 1,
+            col: 0,
+            col_w: w - 2.0 * MARGIN,
+            zone_top: TOP,
+            zone_bottom: None,
+            max_y: TOP,
+            sheet,
+        }
+    }
+    fn full_w(&self) -> f32 {
+        self.w - 2.0 * MARGIN
+    }
+    /// Start a zone of `ncols` equal columns below the current position (optionally ending at `bottom`).
+    fn begin_zone(&mut self, ncols: usize, bottom: Option<f32>) {
+        self.ncols = ncols;
+        self.col = 0;
+        self.col_w = (self.full_w() - (ncols - 1) as f32 * GUTTER) / ncols as f32;
+        self.zone_top = self.y;
+        self.zone_bottom = bottom;
+        self.max_y = self.y;
+    }
+    /// Back to one full-width column, below everything the zone drew on this page.
+    fn end_zone(&mut self) {
+        self.y = self.y.max(self.max_y);
+        self.ncols = 1;
+        self.col = 0;
+        self.col_w = self.full_w();
+        self.zone_bottom = None;
+        self.header_on_page = false;
+    }
+    fn dx(&self) -> f32 {
+        self.col as f32 * (self.col_w + GUTTER)
     }
     fn page(&mut self) -> &mut PlanPage {
         self.pages.last_mut().unwrap()
     }
+    /// Next column of the zone, or a new page when the columns are used up.
     fn new_page(&mut self) {
-        self.pages.push(PlanPage::default());
-        self.y = TOP;
+        self.max_y = self.max_y.max(self.y);
+        if self.col + 1 < self.ncols {
+            self.col += 1;
+            self.y = self.zone_top;
+        } else {
+            self.pages.push(PlanPage { w: self.w, h: self.h, sheet: self.sheet, ..Default::default() });
+            self.col = 0;
+            self.y = TOP;
+            self.zone_top = TOP;
+            self.max_y = TOP;
+            self.zone_bottom = None;
+        }
         self.header_on_page = false;
     }
-    /// Start a new page unless `h` mm still fit (keeps headings with their first rows).
+    /// Start a new column/page unless `h` mm still fit (keeps headings with their first rows).
     fn ensure(&mut self, h: f32) {
         if self.room() < h {
             self.new_page();
         }
     }
-    fn limit(&self) -> f32 {
+    fn page_limit(&self) -> f32 {
         self.h - BOTTOM - if self.key && self.pages.len() == 1 { KEY_ROOM } else { 0.0 }
+    }
+    fn limit(&self) -> f32 {
+        let base = self.page_limit();
+        self.zone_bottom.map(|z| z.min(base)).unwrap_or(base)
     }
     fn room(&self) -> f32 {
         self.limit() - self.y
     }
+    fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, grey: f32) {
+        let dx = self.dx();
+        self.page().items.push(PlanItem::Rect { x: x + dx, y, w, h, grey });
+    }
+    fn rule(&mut self, x1: f32, x2: f32, y: f32, grey: f32) {
+        let dx = self.dx();
+        self.page().items.push(PlanItem::Rule { x1: x1 + dx, x2: x2 + dx, y, grey });
+    }
     fn text(&mut self, text: &str, x: f32, y: f32, size: f32, bold: bool, grey: f32) {
-        self.page().items.push(PlanItem::Text { text: text.into(), x, y, size, bold, grey });
+        let dx = self.dx();
+        self.page().items.push(PlanItem::Text { text: text.into(), x: x + dx, y, size, bold, grey });
     }
     fn mark(&mut self, m: Mark) {
         self.page().marks.push(m);
@@ -516,7 +632,7 @@ impl Flow {
 }
 
 fn line_h(size: f32) -> f32 {
-    size * PT * 1.25
+    size * PT * 1.05
 }
 
 struct Col {
@@ -547,42 +663,40 @@ fn make_row_ex(cols: &[Col], texts: &[String], size: f32, bolds: Vec<bool>, bar:
         .iter()
         .zip(texts)
         .enumerate()
-        .map(|(i, (c, t))| wrap(t, size, bolds[i], c.w - 2.0 * PAD, max_lines))
+        .map(|(i, (c, t))| wrap(t, size, bolds[i], c.w - 2.0 * hpad(), max_lines))
         .collect();
     let lines = cells.iter().map(|c| c.len()).max().unwrap_or(1);
-    Row { cells, h: lines as f32 * line_h(size) + 2.0 * PAD, size, bolds, bar, fill, right }
+    Row { cells, h: lines as f32 * line_h(size) + 2.0 * pad(), size, bolds, bar, fill, right }
 }
 
 fn draw_row(f: &mut Flow, cols: &[Col], r: &Row) {
     let y0 = f.y;
+    let x1 = cols[0].x;
+    let x2 = cols.last().map(|c| c.x + c.w).unwrap_or(x1);
     if let Some(g) = r.fill {
-        let x = cols[0].x;
-        let w = cols.last().map(|c| c.x + c.w - x).unwrap_or(0.0);
-        f.page().items.push(PlanItem::Rect { x, y: y0, w, h: r.h, grey: g });
+        f.rect(x1, y0, x2 - x1, r.h, g);
     }
     if r.bar {
-        f.page().items.push(PlanItem::Rect { x: cols[0].x - 2.6, y: y0, w: 1.8, h: r.h, grey: 0.0 });
+        f.rect(x1 - 2.6, y0, 1.8, r.h, 0.0);
     }
     for (ci, (c, lines)) in cols.iter().zip(&r.cells).enumerate() {
         let bold = r.bolds[ci];
         for (li, l) in lines.iter().enumerate() {
-            let base = y0 + PAD + li as f32 * line_h(r.size) + r.size * PT * 0.95;
+            let base = y0 + pad() + li as f32 * line_h(r.size) + r.size * PT * 0.95;
             let x = if r.right.get(ci).copied().unwrap_or(false) {
-                c.x + c.w - PAD - tw(l, r.size, bold)
+                c.x + c.w - hpad() - tw(l, r.size, bold)
             } else {
-                c.x + PAD
+                c.x + hpad()
             };
             f.text(l, x, base, r.size, bold, 0.0);
         }
     }
-    let x1 = cols[0].x;
-    let x2 = cols.last().map(|c| c.x + c.w).unwrap_or(x1);
-    f.page().items.push(PlanItem::Rule { x1, x2, y: y0 + r.h, grey: if r.bar { 0.35 } else { 0.75 } });
+    f.rule(x1, x2, y0 + r.h, if r.bar { 0.35 } else { 0.75 });
     f.y += r.h;
 }
 
-/// Draw rows with the column header at the top and repeated on every new page; at least two rows
-/// follow the header on each page (no orphaned headers).
+/// Draw rows with the column header at the top and repeated on every new column/page; at least two rows
+/// follow the header (no orphaned headers).
 fn flow_rows(f: &mut Flow, cols: &[Col], hdr: &Row, rows: &[Row]) {
     for (i, r) in rows.iter().enumerate() {
         let next = rows.get(i + 1).map(|n| n.h).unwrap_or(0.0);
@@ -599,11 +713,69 @@ fn flow_rows(f: &mut Flow, cols: &[Col], hdr: &Row, rows: &[Row]) {
     }
 }
 
+/// Like `flow_rows`, for rows drawn with different column sets (`sets[row.0]`), e.g. full-width group rows
+/// between table rows. A group row (set 1) is never left alone at the bottom of a column.
+fn flow_rows_multi(f: &mut Flow, sets: &[&[Col]], hdr_set: usize, hdr: &Row, rows: &[(usize, Row)]) {
+    for (i, (set, r)) in rows.iter().enumerate() {
+        let next = rows.get(i + 1).map(|n| n.1.h).unwrap_or(0.0);
+        let after = if *set == 1 { rows.get(i + 2).map(|n| n.1.h).unwrap_or(0.0) } else { 0.0 };
+        if i == 0 {
+            f.ensure(hdr.h + r.h + next + after);
+            f.mark(Mark::ColHeader);
+            draw_row(f, sets[hdr_set], hdr);
+        } else if f.room() < r.h + if *set == 1 { next + after } else { 0.0 } {
+            f.new_page();
+            f.mark(Mark::ColHeader);
+            draw_row(f, sets[hdr_set], hdr);
+        }
+        draw_row(f, sets[*set], r);
+    }
+}
+
 fn heading(f: &mut Flow, text: &str, size: f32) {
-    f.y += 0.8;
+    f.y += 0.8 * scale();
     let base = f.y + size * PT;
     f.text(text, MARGIN, base, size, true, 0.0);
-    f.y = base + 1.2;
+    f.y = base + 1.2 * scale();
+}
+
+fn heading_h(size: f32) -> f32 {
+    2.0 * scale() + size * PT
+}
+
+/// A shaded one-row sub-heading ("Table 3 · 4 guests").
+fn group_row(f: &mut Flow, text: &str) {
+    let h = group_row_h();
+    let (y0, w) = (f.y, f.col_w);
+    f.rect(MARGIN, y0, w, h, 0.72);
+    let base = y0 + pad() + sub() * PT * 0.95;
+    f.text(text, MARGIN + hpad(), base, sub(), true, 0.0);
+    f.y += h;
+}
+
+fn group_row_h() -> f32 {
+    line_h(sub()) + 2.0 * pad()
+}
+
+/// A wrapped text band under a table group.
+fn band_h(lines: &[String]) -> f32 {
+    lines.len() as f32 * line_h(body()) + 2.0 * pad()
+}
+
+fn draw_band(f: &mut Flow, lines: &[String], grey: f32) {
+    let h = band_h(lines);
+    let y0 = f.y;
+    let w = f.col_w;
+    f.rect(MARGIN, y0, w, h, grey);
+    for (i, l) in lines.iter().enumerate() {
+        let base = y0 + pad() + i as f32 * line_h(body()) + body() * PT * 0.95;
+        f.text(l, MARGIN + hpad(), base, body(), true, 0.0);
+    }
+    f.y += h;
+}
+
+fn page_size(landscape: bool) -> (f32, f32) {
+    if landscape { (297.0, 210.0) } else { (210.0, 297.0) }
 }
 
 /// Lay out the whole plan. `date` is printed in each page header.
@@ -617,14 +789,95 @@ pub fn layout_plan_ex(guests: &[Guest], title: Option<&str>, date: &str, force_l
     layout_plan_courses(guests, title, date, force_landscape, marker_key, &[])
 }
 
-/// Smallest width per table column for the dish x table matrix to be drawn.
-pub const MATRIX_MIN_COL_MM: f32 = 8.0;
+fn with_scale<T>(s: f32, f: impl FnOnce() -> T) -> T {
+    let old = scale();
+    SCALE.with(|c| c.set(s));
+    let r = f();
+    SCALE.with(|c| c.set(old));
+    r
+}
 
-/// Like `layout_plan_ex`, with course columns in the event's course order.
+/// Body font sizes tried, from the largest down to the floor.
+fn body_steps() -> Vec<f32> {
+    let mut v = Vec::new();
+    let mut pt = BODY_MAX_PT;
+    while pt >= BODY_MIN_PT - 0.01 {
+        v.push(pt);
+        pt -= 0.5;
+    }
+    v
+}
+
+/// One candidate sheet layout.
+struct Sheet {
+    pages: Vec<PlanPage>,
+    pt: f32,
+    landscape: bool,
+    matrix: bool,
+}
+
+/// Pick the best layout of one sheet: the largest body size at which it fits one page (then portrait,
+/// then fewer columns); if it never fits, the fewest pages at the floor size.
+fn best_sheet(orients: &[bool], max_cols: usize, min_col_mm: f32, build: &dyn Fn(bool, usize, f32) -> Option<Sheet>) -> Sheet {
+    let steps = body_steps();
+    let mut fallback: Option<Sheet> = None;
+    for (si, pt) in steps.iter().enumerate() {
+        let s = pt / BODY_MAX_PT;
+        let mut best: Option<Sheet> = None;
+        for &landscape in orients {
+            let (w, _) = page_size(landscape);
+            for ncols in 1..=max_cols {
+                let col_w = (w - 2.0 * MARGIN - (ncols - 1) as f32 * GUTTER) / ncols as f32;
+                if ncols > 1 && col_w < min_col_mm * s {
+                    continue;
+                }
+                if let Some(sh) = with_scale(s, || build(landscape, ncols, s)) {
+                    if sh.pages.len() == 1 {
+                        if best.is_none() {
+                            best = Some(sh);
+                        }
+                    } else if si + 1 == steps.len() {
+                        let better = fallback.as_ref().map(|f| sh.pages.len() < f.pages.len()).unwrap_or(true);
+                        if better {
+                            fallback = Some(sh);
+                        }
+                    }
+                }
+            }
+            if best.is_some() {
+                break; // portrait first; landscape only if portrait does not fit at this size
+            }
+        }
+        if let Some(mut b) = best {
+            b.pt = *pt;
+            return b;
+        }
+    }
+    let mut f = fallback.expect("a layout is always produced at the floor size");
+    f.pt = BODY_MIN_PT;
+    f
+}
+
+/// Smallest column width (mm, at full size) for the dish x table matrix: room for "10*".
+fn matrix_min_col() -> f32 {
+    1.9 * body() * PT + 2.0 * hpad()
+}
+
+fn matrix_fixed(landscape: bool) -> (f32, f32) {
+    ((if landscape { 66.0 } else { 48.0 }) * scale(), 14.0 * scale())
+}
+
+fn matrix_fits(landscape: bool, n_tables: usize) -> bool {
+    let (w, _) = page_size(landscape);
+    let (label_w, total_w) = matrix_fixed(landscape);
+    (w - 2.0 * MARGIN - label_w - total_w) / n_tables.max(1) as f32 >= matrix_min_col()
+}
+
+/// Layout of the two sheets: Kitchen (dietary list, totals, portions, matrix) and Tables (every table's
+/// guests and runner summary), each scaled to fit one page (body 9 pt down to a 6 pt floor); a sheet that
+/// still does not fit at the floor continues onto more pages and a warning is returned.
 ///
-/// Portrait and landscape are both laid out, each with and without a column-header row per table, and
-/// the layout with the fewest pages wins (ties: portrait, then one continuous table). `force_landscape`
-/// restricts the choice to landscape.
+/// The orientation is chosen per sheet; `force_landscape` makes both landscape.
 pub fn layout_plan_courses(
     guests: &[Guest],
     title: Option<&str>,
@@ -637,85 +890,137 @@ pub fn layout_plan_courses(
     let marker_key = marker_key && a.guests.iter().any(|g| !g.dietary.is_empty());
     let n_tables = a.tables.len();
     let wanted = n_tables > 0 && a.dishes.iter().any(|d| !d.is_empty());
-    let fits = |landscape: bool| {
-        let (w, _) = page_size(landscape);
-        let (label_w, total_w) = matrix_fixed(landscape);
-        (w - 2.0 * MARGIN - label_w - total_w) / n_tables.max(1) as f32 >= MATRIX_MIN_COL_MM
-    };
-    // The matrix is drawn whenever some orientation can fit it; orientations that cannot are skipped.
-    let matrix = wanted && fits(true);
-    let mut best: Option<PlanLayout> = None;
-    for landscape in [false, true] {
-        if (!landscape && force_landscape) || (matrix && !fits(landscape)) {
-            continue;
+    let orients: Vec<bool> = if force_landscape { vec![true] } else { vec![false, true] };
+
+    let kitchen = best_sheet(&orients, 3, 85.0, &|landscape, ncols, _s| {
+        // the matrix is drawn whenever it fits at this size; a size where it cannot is skipped, except
+        // at the floor, where it is left out with a note
+        let fits = !wanted || matrix_fits(landscape, n_tables);
+        if !fits && body() > BODY_MIN_PT + 0.01 {
+            return None;
         }
-        for per_table_headers in [false, true] {
-            let l = build_plan(&a, title, date, landscape, per_table_headers, marker_key, matrix, wanted && !matrix);
-            if best.as_ref().map(|b| l.pages.len() < b.pages.len()).unwrap_or(true) {
-                best = Some(l);
+        let matrix = wanted && fits;
+        let pages = kitchen_sheet(&a, landscape, ncols, matrix, wanted && !fits, marker_key);
+        Some(Sheet { pages, pt: body(), landscape, matrix })
+    });
+    let tables = best_sheet(&orients, 4, 62.0, &|landscape, ncols, _s| {
+        let mut pages = tables_sheet(&a, landscape, ncols, false)?;
+        // Only at the 6 pt floor, and only when it saves a page: let a table continue in the next column.
+        if pages.len() > 1 && body() <= BODY_MIN_PT + 0.01 {
+            if let Some(alt) = tables_sheet(&a, landscape, ncols, true) {
+                if alt.len() < pages.len() {
+                    pages = alt;
+                }
             }
         }
+        Some(Sheet { pages, pt: body(), landscape, matrix: false })
+    });
+
+    let mut warnings = Vec::new();
+    if kitchen.pages.len() > 1 {
+        warnings.push(format!("Kitchen sheet needs {} pages even at {} pt", kitchen.pages.len(), BODY_MIN_PT));
     }
-    best.unwrap_or_else(|| build_plan(&a, title, date, true, false, marker_key, matrix, wanted && !matrix))
-}
-
-fn page_size(landscape: bool) -> (f32, f32) {
-    if landscape { (297.0, 210.0) } else { (210.0, 297.0) }
-}
-
-/// (dish label column, total column) widths of the matrix.
-fn matrix_fixed(landscape: bool) -> (f32, f32) {
-    (if landscape { 70.0 } else { 50.0 }, 14.0)
-}
-
-/// A shaded one-row sub-heading ("Table 3 · 4 guests"); `size` is 10 pt.
-fn group_row(f: &mut Flow, cw: f32, text: &str) {
-    let h = line_h(SUB) + 2.0 * PAD;
-    let y0 = f.y;
-    f.page().items.push(PlanItem::Rect { x: MARGIN, y: y0, w: cw, h, grey: 0.72 });
-    let base = f.y + PAD + SUB * PT * 0.95;
-    f.text(text, MARGIN + PAD, base, SUB, true, 0.0);
-    f.y += h;
-}
-
-fn group_row_h() -> f32 {
-    line_h(SUB) + 2.0 * PAD
-}
-
-/// Wrapped text band(s) under a table group; returns the height used.
-fn band_h(lines: &[String]) -> f32 {
-    lines.len() as f32 * line_h(BODY) + 2.0 * PAD
-}
-
-fn draw_band(f: &mut Flow, cw: f32, lines: &[String], grey: f32, bar: bool) {
-    let h = band_h(lines);
-    let y0 = f.y;
-    f.page().items.push(PlanItem::Rect { x: MARGIN, y: y0, w: cw, h, grey });
-    if bar {
-        f.page().items.push(PlanItem::Rect { x: MARGIN - 2.6, y: y0, w: 1.8, h, grey: 0.0 });
+    if tables.pages.len() > 1 {
+        warnings.push(format!("Tables sheet needs {} pages even at {} pt", tables.pages.len(), BODY_MIN_PT));
     }
-    for (i, l) in lines.iter().enumerate() {
-        let base = y0 + PAD + i as f32 * line_h(BODY) + BODY * PT * 0.95;
-        f.text(l, MARGIN + PAD, base, BODY, true, 0.0);
+    let (landscape, w, h) = (kitchen.landscape, kitchen.pages[0].w, kitchen.pages[0].h);
+    let (matrix_included, kitchen_pt, tables_pt) = (kitchen.matrix, kitchen.pt, tables.pt);
+    let mut pages = kitchen.pages;
+    pages.extend(tables.pages);
+
+    // ---- Allergy-marker key (page 1, bottom), page headers and footers
+    if marker_key {
+        let ph = pages[0].h;
+        let p = &mut pages[0];
+        p.items.push(PlanItem::Dot { x: MARGIN + 1.4, y: ph - 10.0, r: 1.2 });
+        p.items.push(PlanItem::Text {
+            text: "on a place card = guest has a dietary requirement / allergy (see list above)".into(),
+            x: MARGIN + 4.2,
+            y: ph - 9.0,
+            size: 8.0,
+            bold: false,
+            grey: 0.2,
+        });
     }
-    f.y += h;
+    let total = pages.len();
+    let head = match title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => format!("{t} \u{2014} Seating plan & menu"),
+        None => "Seating plan & menu".to_string(),
+    };
+    let date_txt = format!("Generated {date}");
+    for (i, p) in pages.iter_mut().enumerate() {
+        let (pw, ph) = (p.w, p.h);
+        let head = format!("{head} \u{2014} {}", p.sheet);
+        let head = ellipsize(&head, 12.0, true, pw - 2.0 * MARGIN - tw(&date_txt, 8.0, false) - 6.0);
+        p.items.push(PlanItem::Text { text: head, x: MARGIN, y: MARGIN + 3.6, size: 12.0, bold: true, grey: 0.0 });
+        p.items.push(PlanItem::Text { text: date_txt.clone(), x: pw - MARGIN - tw(&date_txt, 8.0, false), y: MARGIN + 3.6, size: 8.0, bold: false, grey: 0.35 });
+        p.items.push(PlanItem::Rule { x1: MARGIN, x2: pw - MARGIN, y: MARGIN + 5.2, grey: 0.4 });
+        let foot = format!("Page {} of {}", i + 1, total);
+        p.items.push(PlanItem::Text { text: foot.clone(), x: pw / 2.0 - tw(&foot, 8.0, false) / 2.0, y: ph - 5.0, size: 8.0, bold: false, grey: 0.35 });
+    }
+    PlanLayout { landscape, w, h, pages, matrix_included, warnings, kitchen_pt, tables_pt }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_plan(
-    a: &Analysis,
-    title: Option<&str>,
-    date: &str,
-    landscape: bool,
-    per_table_headers: bool,
-    marker_key: bool,
-    matrix: bool,
-    matrix_omitted: bool,
-) -> PlanLayout {
+/// The dish x table matrix block (heading text, header row, rows, columns) for the full page width.
+fn matrix_block(a: &Analysis, landscape: bool, cw: f32) -> (Vec<Col>, Row, Vec<Row>) {
+    let n_tables = a.tables.len();
+    let all_dishes: Vec<(usize, &String)> = a.dishes.iter().enumerate().flat_map(|(c, v)| v.iter().map(move |d| (c, d))).collect();
+    let (label_w, total_w) = matrix_fixed(landscape);
+    let tw_each = ((cw - label_w - total_w) / n_tables as f32).min(22.0 * scale());
+    let mut cols = vec![Col { x: MARGIN, w: label_w }];
+    for i in 0..n_tables {
+        cols.push(Col { x: MARGIN + label_w + i as f32 * tw_each, w: tw_each });
+    }
+    cols.push(Col { x: MARGIN + label_w + n_tables as f32 * tw_each, w: total_w });
+    let right: Vec<bool> = std::iter::once(false).chain((0..=n_tables).map(|_| true)).collect();
+    let mut head_txt = vec!["Dish".to_string()];
+    head_txt.extend(a.tables.iter().map(|t| ellipsize(&t.name, head(), true, tw_each - 2.0 * hpad())));
+    head_txt.push("Total".into());
+    let hr = make_row(&cols, &head_txt, head(), true, Some(0.82), right.clone(), 1);
+    let per_table: Vec<Vec<Vec<(String, usize)>>> = a.tables.iter().map(|t| a.counts(Some(&t.guests))).collect();
+    let per_table_diet: Vec<Vec<Vec<(String, usize)>>> = a.tables.iter().map(|t| a.counts_which(Some(&t.guests), Which::Dietary)).collect();
+    let mut mrows: Vec<Row> = Vec::new();
+    let mut last_course = usize::MAX;
+    let mut shade = false;
+    for (ci, dish) in &all_dishes {
+        if *ci != last_course {
+            last_course = *ci;
+            let mut ct = vec![a.columns[*ci].clone()];
+            ct.extend(std::iter::repeat(String::new()).take(n_tables + 1));
+            mrows.push(make_row(&cols, &ct, body(), true, Some(0.9), right.clone(), 1));
+        }
+        let mut txt = vec![(*dish).clone()];
+        let mut total = 0;
+        for (pt, pd) in per_table.iter().zip(&per_table_diet) {
+            let c = pt[*ci].iter().find(|(d, _)| d == *dish).map(|x| x.1).unwrap_or(0);
+            let dc = pd[*ci].iter().find(|(d, _)| d == *dish).map(|x| x.1).unwrap_or(0);
+            total += c;
+            txt.push(if c == 0 { "\u{b7}".into() } else if dc > 0 { format!("{c}*") } else { c.to_string() });
+        }
+        txt.push(total.to_string());
+        shade = !shade;
+        mrows.push(make_row(&cols, &txt, body(), false, shade.then_some(0.96), right.clone(), 2));
+    }
+    (cols, hr, mrows)
+}
+
+const MATRIX_TITLE: &str = "Dishes by table (all portions, incl. dietary)";
+
+/// Kitchen sheet: dietary list, kitchen totals, dietary portions (in `ncols` columns) and the matrix below.
+fn kitchen_sheet(a: &Analysis, landscape: bool, ncols: usize, matrix: bool, matrix_omitted: bool, marker_key: bool) -> Vec<PlanPage> {
     let n_tables = a.tables.len();
     let (w, h) = page_size(landscape);
-    let cw = w - 2.0 * MARGIN;
-    let mut f = Flow::new(h, marker_key);
+    let mut f = Flow::new(w, h, marker_key, "Kitchen");
+    let cw_full = f.full_w();
+    let note_h = 1.0 + 8.0 * PT + 1.0;
+    let mblock = matrix.then(|| matrix_block(a, landscape, cw_full));
+    let matrix_h = mblock
+        .as_ref()
+        .map(|(_, hr, rows)| gap() + heading_h(sub()) + hr.h + rows.iter().map(|r| r.h).sum::<f32>() + note_h)
+        .unwrap_or(0.0);
+    let zone_bottom = (matrix_h > 0.0 && matrix_h < f.page_limit() - TOP - 25.0).then(|| f.page_limit() - matrix_h);
+    f.begin_zone(ncols, zone_bottom);
+    let cw = f.col_w;
     let flagged: Vec<(&str, &PGuest)> = a
         .tables
         .iter()
@@ -726,25 +1031,25 @@ fn build_plan(
 
     // ---- Dietary requirements & allergies (first, so the kitchen cannot miss it)
     f.mark(Mark::Dietary);
-    f.ensure(SECTION * PT + 12.0 + 2.0 * line_h(BODY) + 2.0 * (line_h(BODY) + 2.0 * PAD));
-    heading(&mut f, "Dietary requirements & allergies", SECTION);
+    f.ensure(heading_h(section()) + 3.0 * line_h(body()) + 2.0 * (line_h(body()) + 2.0 * pad()));
+    heading(&mut f, "Dietary requirements & allergies", section());
     if flagged.is_empty() {
-        let base = f.y + BODY * PT;
-        f.text("No dietary requirements recorded.", MARGIN, base, BODY, true, 0.0);
-        f.y = base + 2.0;
+        let base = f.y + body() * PT;
+        f.text("No dietary requirements recorded.", MARGIN, base, body(), true, 0.0);
+        f.y = base + 2.0 * scale();
     } else {
-        for l in wrap(&format!("Totals: {}", a.diet_totals()), BODY, true, cw, 4) {
-            let base = f.y + BODY * PT;
-            f.text(&l, MARGIN, base, BODY, true, 0.0);
-            f.y = base + 1.2;
+        for l in wrap(&format!("Totals: {}", a.diet_totals()), body(), true, cw, 6) {
+            let base = f.y + body() * PT;
+            f.text(&l, MARGIN, base, body(), true, 0.0);
+            f.y = base + 1.2 * scale();
         }
-        f.y += 0.8;
+        f.y += 0.8 * scale();
         let dcols = vec![
-            Col { x: MARGIN, w: cw * 0.10 },
-            Col { x: MARGIN + cw * 0.10, w: cw * 0.34 },
-            Col { x: MARGIN + cw * 0.44, w: cw * 0.56 },
+            Col { x: MARGIN, w: cw * 0.11 },
+            Col { x: MARGIN + cw * 0.11, w: cw * 0.34 },
+            Col { x: MARGIN + cw * 0.45, w: cw * 0.55 },
         ];
-        let dh = make_row(&dcols, &["Table".into(), "Guest".into(), "Requirements".into()], HEAD, true, Some(0.82), vec![false; 3], 1);
+        let dh = make_row(&dcols, &["Table".into(), "Guest".into(), "Requirements".into()], head(), true, Some(0.82), vec![false; 3], 1);
         let rows: Vec<Row> = flagged
             .iter()
             .enumerate()
@@ -752,7 +1057,7 @@ fn build_plan(
                 make_row_ex(
                     &dcols,
                     &[tname.to_string(), g.name.clone(), format!("! {}", g.diet.describe())],
-                    BODY,
+                    body(),
                     vec![true, false, true],
                     true,
                     Some(if i % 2 == 0 { 0.86 } else { 0.78 }),
@@ -763,37 +1068,46 @@ fn build_plan(
             .collect();
         flow_rows(&mut f, &dcols, &dh, &rows);
     }
-    f.y += GAP;
+    f.y += gap();
 
     // ---- Kitchen totals
     f.mark(Mark::Totals);
-    f.ensure(SECTION * PT + 2.0 + 2.0 * line_h(BODY) + SUB * PT + 4.0 + 3.0 * (line_h(BODY) + 2.0 * PAD));
-    heading(&mut f, "Kitchen totals", SECTION);
+    f.ensure(heading_h(section()) + 2.0 * line_h(body()) + heading_h(sub()) + 3.0 * (line_h(body()) + 2.0 * pad()));
+    heading(&mut f, "Kitchen totals", section());
     let n = a.guests.len();
     let n_diet = a.guests.iter().filter(|g| !g.dietary.is_empty()).count();
     let line = format!(
         "Total guests: {n}  \u{b7}  Tables: {n_tables}  \u{b7}  Guests with no menu choices: {}  \u{b7}  Guests with dietary requirements: {n_diet}",
         a.no_menu
     );
-    for l in wrap(&line, BODY, true, cw, 2) {
-        let base = f.y + BODY * PT;
-        f.text(&l, MARGIN, base, BODY, true, 0.0);
-        f.y = base + 1.2;
+    for l in wrap(&line, body(), true, cw, 3) {
+        let base = f.y + body() * PT;
+        f.text(&l, MARGIN, base, body(), true, 0.0);
+        f.y = base + 1.2 * scale();
     }
-    f.y += 0.8;
+    f.y += 0.8 * scale();
     let std = a.counts_which(None, Which::Standard);
     let dietc = a.counts_which(None, Which::Dietary);
     let portions = a.diet_portions();
-    heading(&mut f, "Standard portions", SUB);
+    heading(&mut f, "Standard portions", sub());
     let tot_cols = vec![
-        Col { x: MARGIN, w: cw * 0.17 },
-        Col { x: MARGIN + cw * 0.17, w: cw * 0.35 },
+        Col { x: MARGIN, w: cw * 0.20 },
+        Col { x: MARGIN + cw * 0.20, w: cw * 0.32 },
         Col { x: MARGIN + cw * 0.52, w: cw * 0.15 },
         Col { x: MARGIN + cw * 0.67, w: cw * 0.17 },
         Col { x: MARGIN + cw * 0.84, w: cw * 0.16 },
     ];
     let right5 = vec![false, false, true, true, true];
-    let hdr = make_row(&tot_cols, &["Course", "Dish", "Standard", "+ Dietary", "= Total"].map(String::from), HEAD, true, Some(0.82), right5.clone(), 2);
+    let fit = |i: usize, long: &str, short: &str| if tw(long, head(), true) <= tot_cols[i].w - 2.0 * hpad() { long.to_string() } else { short.to_string() };
+    let hdr = make_row(
+        &tot_cols,
+        &["Course".to_string(), "Dish".to_string(), fit(2, "Standard", "Std"), fit(3, "+ Dietary", "+Diet"), fit(4, "= Total", "=Tot")],
+        head(),
+        true,
+        Some(0.82),
+        right5.clone(),
+        2,
+    );
     let mut rows = Vec::new();
     let mut course_idx = 0;
     for (ci, list) in std.iter().enumerate() {
@@ -802,7 +1116,7 @@ fn build_plan(
             rows.push(make_row(
                 &tot_cols,
                 &[if di == 0 { a.columns[ci].clone() } else { String::new() }, dish.clone(), cnt.to_string(), d.to_string(), (cnt + d).to_string()],
-                BODY,
+                body(),
                 false,
                 (course_idx % 2 == 1).then_some(0.95),
                 right5.clone(),
@@ -814,110 +1128,66 @@ fn build_plan(
         }
     }
     if rows.is_empty() {
-        let base = f.y + BODY * PT;
-        f.text("No menu choices have been entered.", MARGIN, base, BODY, false, 0.3);
-        f.y = base + 2.0;
+        let base = f.y + body() * PT;
+        f.text("No menu choices have been entered.", MARGIN, base, body(), false, 0.3);
+        f.y = base + 2.0 * scale();
     } else {
         flow_rows(&mut f, &tot_cols, &hdr, &rows);
     }
 
-    f.y += GAP;
+    f.y += gap();
     f.mark(Mark::DietaryPortions);
-    f.ensure(SUB * PT + 4.0 + 3.0 * (line_h(BODY) + 2.0 * PAD));
-    heading(&mut f, "Dietary / allergy portions", SUB);
+    f.ensure(heading_h(sub()) + 3.0 * (line_h(body()) + 2.0 * pad()));
+    heading(&mut f, "Dietary / allergy portions", sub());
     if portions.is_empty() {
-        let base = f.y + BODY * PT;
-        f.text("No dietary portions.", MARGIN, base, BODY, true, 0.0);
-        f.y = base + 2.0;
+        let base = f.y + body() * PT;
+        f.text("No dietary portions.", MARGIN, base, body(), true, 0.0);
+        f.y = base + 2.0 * scale();
     } else {
+        // Count | Requirements | Guests (Table); each course/dish is a shaded group row above its lines
         let pcols = vec![
             Col { x: MARGIN, w: cw * 0.10 },
-            Col { x: MARGIN + cw * 0.10, w: cw * 0.17 },
-            Col { x: MARGIN + cw * 0.27, w: cw * 0.23 },
-            Col { x: MARGIN + cw * 0.50, w: cw * 0.07 },
-            Col { x: MARGIN + cw * 0.57, w: cw * 0.43 },
+            Col { x: MARGIN + cw * 0.10, w: cw * 0.36 },
+            Col { x: MARGIN + cw * 0.46, w: cw * 0.54 },
         ];
-        let ph = make_row(
-            &pcols,
-            &["Course", "Dish", "Requirements", "Count", "Guests (Table)"].map(String::from),
-            HEAD,
-            true,
-            Some(0.82),
-            vec![false, false, false, true, false],
-            2,
-        );
-        let mut prows = Vec::new();
+        let full = vec![Col { x: MARGIN, w: cw }];
+        let cnt = if tw("Count", head(), true) <= pcols[0].w - 2.0 * hpad() { "Count" } else { "#" };
+        let ph = make_row(&pcols, &[cnt.into(), "Requirements".into(), "Guests (Table)".into()], head(), true, Some(0.82), vec![true, false, false], 2);
+        let mut prows: Vec<(usize, Row)> = Vec::new();
         let mut last: (Option<usize>, String) = (Some(usize::MAX), String::new());
         for (i, p) in portions.iter().enumerate() {
-            let same_course = last.0 == p.col;
-            let same_dish = same_course && last.1 == p.dish;
-            last = (p.col, p.dish.clone());
+            if last != (p.col, p.dish.clone()) {
+                last = (p.col, p.dish.clone());
+                let course = p.col.map(|c| a.columns[c].clone()).unwrap_or_else(|| "\u{2014}".into());
+                prows.push((1, make_row_ex(&full, &[format!("{course} \u{b7} {}", p.dish)], body(), vec![true], false, Some(0.68), vec![false], 2)));
+            }
             let guests = p.guests.iter().map(|(n, t)| format!("{n} (T{t})")).collect::<Vec<_>>().join(", ");
-            prows.push(make_row_ex(
-                &pcols,
-                &[
-                    if same_course { String::new() } else { p.col.map(|c| a.columns[c].clone()).unwrap_or_else(|| "\u{2014}".into()) },
-                    if same_dish { String::new() } else { p.dish.clone() },
-                    format!("! {}", p.combo),
-                    p.guests.len().to_string(),
-                    guests,
-                ],
-                BODY,
-                vec![true, true, true, true, false],
-                true,
-                Some(if i % 2 == 0 { 0.86 } else { 0.78 }),
-                vec![false, false, false, true, false],
-                DIET_LINES,
+            prows.push((
+                0,
+                make_row_ex(
+                    &pcols,
+                    &[p.guests.len().to_string(), format!("! {}", p.combo), guests],
+                    body(),
+                    vec![true, true, false],
+                    true,
+                    Some(if i % 2 == 0 { 0.86 } else { 0.78 }),
+                    vec![true, false, false],
+                    DIET_LINES,
+                ),
             ));
         }
-        flow_rows(&mut f, &pcols, &ph, &prows);
+        flow_rows_multi(&mut f, &[&pcols, &full], 0, &ph, &prows);
     }
+    f.end_zone();
 
-    // ---- Dish x table matrix (all portions)
-    if matrix {
-        f.y += GAP;
-        let all_dishes: Vec<(usize, &String)> = a.dishes.iter().enumerate().flat_map(|(c, v)| v.iter().map(move |d| (c, d))).collect();
-        let (label_w, total_w) = matrix_fixed(landscape);
-        let tw_each = ((cw - label_w - total_w) / n_tables as f32).min(22.0);
-        let mut cols = vec![Col { x: MARGIN, w: label_w }];
-        for i in 0..n_tables {
-            cols.push(Col { x: MARGIN + label_w + i as f32 * tw_each, w: tw_each });
-        }
-        cols.push(Col { x: MARGIN + label_w + n_tables as f32 * tw_each, w: total_w });
-        let right: Vec<bool> = std::iter::once(false).chain((0..=n_tables).map(|_| true)).collect();
-        let mut head_txt = vec!["Dish".to_string()];
-        head_txt.extend(a.tables.iter().map(|t| ellipsize(&t.name, HEAD, true, tw_each - 2.0 * PAD)));
-        head_txt.push("Total".into());
-        let hr = make_row(&cols, &head_txt, HEAD, true, Some(0.82), right.clone(), 1);
-        let per_table: Vec<Vec<Vec<(String, usize)>>> = a.tables.iter().map(|t| a.counts(Some(&t.guests))).collect();
-        let per_table_diet: Vec<Vec<Vec<(String, usize)>>> = a.tables.iter().map(|t| a.counts_which(Some(&t.guests), Which::Dietary)).collect();
-        let mut mrows: Vec<Row> = Vec::new();
-        let mut last_course = usize::MAX;
-        let mut shade = false;
-        for (ci, dish) in &all_dishes {
-            if *ci != last_course {
-                last_course = *ci;
-                let mut ct = vec![a.columns[*ci].clone()];
-                ct.extend(std::iter::repeat(String::new()).take(n_tables + 1));
-                mrows.push(make_row(&cols, &ct, BODY, true, Some(0.9), right.clone(), 1));
-            }
-            let mut txt = vec![(*dish).clone()];
-            let mut total = 0;
-            for (pt, pd) in per_table.iter().zip(&per_table_diet) {
-                let c = pt[*ci].iter().find(|(d, _)| d == *dish).map(|x| x.1).unwrap_or(0);
-                let dc = pd[*ci].iter().find(|(d, _)| d == *dish).map(|x| x.1).unwrap_or(0);
-                total += c;
-                txt.push(if c == 0 { "\u{b7}".into() } else if dc > 0 { format!("{c}*") } else { c.to_string() });
-            }
-            txt.push(total.to_string());
-            shade = !shade;
-            mrows.push(make_row(&cols, &txt, BODY, false, shade.then_some(0.96), right.clone(), 2));
-        }
+    // ---- Dish x table matrix (all portions), full width below the columns
+    if let Some((cols, hr, mrows)) = mblock {
+        f.y += gap();
         f.mark(Mark::Matrix);
-        f.ensure(SUB * PT + 4.0 + hr.h + 3.0 * (line_h(BODY) + 2.0 * PAD));
-        heading(&mut f, "Dishes by table (all portions, incl. dietary)", SUB);
+        f.ensure(heading_h(sub()) + hr.h + 3.0 * (line_h(body()) + 2.0 * pad()));
+        heading(&mut f, MATRIX_TITLE, sub());
         flow_rows(&mut f, &cols, &hr, &mrows);
-        if f.room() < 5.0 {
+        if f.room() < note_h {
             f.new_page();
         }
         let base = f.y + 1.0 + 8.0 * PT;
@@ -926,27 +1196,85 @@ fn build_plan(
     } else if matrix_omitted {
         f.y += 1.0;
         let base = f.y + 8.0 * PT;
-        f.text(&format!("(Dish-by-table matrix omitted: more than {} tables.)", n_tables), MARGIN, base, 8.0, false, 0.35);
-        f.y = base + 1.0;
+        f.text(&format!("(Dish-by-table matrix omitted: {n_tables} tables are too many for the page width.)"), MARGIN, base, 8.0, false, 0.35);
     }
-    f.y += GAP;
+    if f.pages.len() > 1 && f.pages.last().map(|p| p.items.is_empty()).unwrap_or(false) {
+        f.pages.pop();
+    }
+    f.pages
+}
 
-    // ---- Table sections: one continuous table; each table is a shaded sub-heading row followed by its guests
-    // and its runner summary. A section may continue on the next page ("Table N (cont.)") with the
-    // column headers repeated.
+/// Tables sheet: every table's guests (course dishes and Dietary / allergies next to the name) and the
+/// runner summary of standard portions, in `ncols` newspaper columns. A table is not split across columns
+/// unless it is taller than a column or `split_ok` (used at the floor size to save a page).
+fn tables_sheet(a: &Analysis, landscape: bool, ncols: usize, split_ok: bool) -> Option<Vec<PlanPage>> {
+    let (w, h) = page_size(landscape);
+    let mut f = Flow::new(w, h, false, "Tables");
+    f.begin_zone(ncols, None);
+    let cw = f.col_w;
     let n_cols = a.columns.len();
-    let diet_w = if landscape { 75.0 } else { 50.0 };
-    let name_w = if n_cols == 0 { cw - diet_w } else if landscape { 52.0 } else { 36.0 };
-    let course_w = if n_cols == 0 { 0.0 } else { (cw - name_w - diet_w) / n_cols as f32 };
-    let mut cols = vec![Col { x: MARGIN, w: name_w }];
-    for i in 0..n_cols {
-        cols.push(Col { x: MARGIN + name_w + i as f32 * course_w, w: course_w });
+    // Column widths follow the content: every column is at least as wide as its longest word (nothing
+    // breaks mid-word), grows towards its longest single-line text (capped, so long names and dishes
+    // wrap), and the widths are then fitted to the column.
+    let nc = n_cols + 2;
+    let mut line = vec![0.0_f32; nc];
+    let mut word = vec![0.0_f32; nc];
+    let mut note = |i: usize, text: &str, bold: bool, size: f32| {
+        line[i] = line[i].max(tw(text, size, bold));
+        for wd in text.split_whitespace() {
+            // a hyphenated word may break after its hyphens, so only its longest part must fit
+            for part in wd.split_inclusive('-') {
+                word[i] = word[i].max(tw(part, size, bold));
+            }
+        }
+    };
+    for g in &a.guests {
+        note(0, &g.name, false, body());
+        for (i, cell) in g.cells.iter().enumerate() {
+            note(1 + i, &cell.join(", "), false, body());
+        }
+        if !g.dietary.is_empty() {
+            note(nc - 1, &format!("! {}", g.diet.describe()), true, body());
+        }
     }
-    cols.push(Col { x: MARGIN + name_w + n_cols as f32 * course_w, w: diet_w });
+    for (i, c) in a.columns.iter().enumerate() {
+        note(1 + i, c, true, head());
+    }
+    note(nc - 1, "Dietary", true, head());
+    let extra_pad = 2.0 * hpad() + 0.4;
+    let lo: Vec<f32> = word.iter().map(|w| w + extra_pad).collect();
+    let caps: Vec<f32> = (0..nc).map(|i| if i == 0 { 0.30 } else if i == nc - 1 { 0.36 } else { 0.22 } * cw).collect();
+    let hi: Vec<f32> = (0..nc).map(|i| (line[i] + extra_pad).min(caps[i]).max(lo[i])).collect();
+    let lo_sum: f32 = lo.iter().sum();
+    // several columns are only used when every word fits its cell uncut
+    if ncols > 1 && lo_sum > cw {
+        return None;
+    }
+    let widths: Vec<f32> = if lo_sum >= cw {
+        lo.iter().map(|l| l * cw / lo_sum).collect()
+    } else {
+        let want: f32 = hi.iter().zip(&lo).map(|(h, l)| h - l).sum();
+        let room = cw - lo_sum;
+        if want <= room {
+            let hi_sum: f32 = hi.iter().sum();
+            hi.iter().map(|h| h * cw / hi_sum).collect()
+        } else {
+            lo.iter().zip(&hi).map(|(l, h)| l + (h - l) * room / want).collect()
+        }
+    };
+    let mut cols = Vec::new();
+    let mut x = MARGIN;
+    for wd in &widths {
+        cols.push(Col { x, w: *wd });
+        x += wd;
+    }
     let mut head_txt = vec!["Guest name".to_string()];
-    head_txt.extend(a.columns.iter().cloned());
+    for c in &a.columns {
+        // abbreviate course headers that do not fit their column
+        head_txt.push(if tw(c, head(), true) > cols[1 + head_txt.len() - 1].w - 2.0 * hpad() { format!("{}.", c.chars().take(3).collect::<String>()) } else { c.clone() });
+    }
     head_txt.push("Dietary / allergies".into());
-    let hr = make_row(&cols, &head_txt, HEAD, true, Some(0.82), vec![false; cols.len()], 2);
+    let hr = make_row(&cols, &head_txt, head(), true, Some(0.82), vec![false; cols.len()], 3);
     for t in &a.tables {
         let rows: Vec<Row> = t
             .guests
@@ -966,23 +1294,28 @@ fn build_plan(
                     *bolds.last_mut().unwrap() = true;
                 }
                 let fill = if flagged { Some(0.8) } else { (i % 2 == 1).then_some(0.95) };
-                // requirements are safety-critical: allow up to 6 lines before any ellipsis
-                make_row_ex(&cols, &txt, BODY, bolds, flagged, fill, vec![false; cols.len()], if flagged { DIET_LINES } else { MAX_LINES })
+                // the dietary text is safety-critical: it wraps fully (no ellipsis)
+                make_row_ex(&cols, &txt, body(), bolds, flagged, fill, vec![false; cols.len()], if flagged { 40 } else { MAX_LINES })
             })
             .collect();
-        let (c_text, d_text) = a.summary_parts(&t.guests);
-        let c_lines = wrap(&c_text, BODY, true, cw - 2.0 * PAD, 6);
-        let d_lines = d_text.map(|d| wrap(&format!("! {d}"), BODY, true, cw - 2.0 * PAD, 8));
-        let sum_h = band_h(&c_lines) + d_lines.as_ref().map(|l| band_h(l) + 0.6).unwrap_or(0.0);
+        // runner summary: standard portions only (the dietary text is already in each guest's row)
+        let (c_text, _) = a.summary_parts(&t.guests);
+        let c_lines = wrap(&c_text, body(), true, cw - 2.0 * hpad(), 6);
+        let sum_h = band_h(&c_lines) + 0.6 * scale();
         let label = format!("Table {} \u{b7} {} guest{}", t.name, t.guests.len(), if t.guests.len() == 1 { "" } else { "s" });
         let mut cont = false;
-        // start: sub-heading + (column header) + first row (+ the summary if it is the only row)
-        let need_hdr = per_table_headers || !f.header_on_page;
+        let total_h = group_row_h() + hr.h + rows.iter().map(|r| r.h).sum::<f32>() + sum_h;
+        let col_h = f.limit() - f.zone_top;
+        // never split a table across columns unless it is taller than a whole column
+        if !split_ok && f.y > f.zone_top + 0.01 && total_h <= col_h && f.room() < total_h {
+            f.new_page();
+        }
+        let need_hdr = !f.header_on_page;
         let need = group_row_h() + if need_hdr { hr.h } else { 0.0 } + rows[0].h + if rows.len() == 1 { sum_h } else { 0.0 };
         f.ensure(need);
-        let need_hdr = per_table_headers || !f.header_on_page;
+        let need_hdr = !f.header_on_page;
         f.mark(Mark::Section { table: t.name.clone(), cont });
-        group_row(&mut f, cw, &label);
+        group_row(&mut f, &label);
         if need_hdr {
             f.mark(Mark::ColHeader);
             draw_row(&mut f, &cols, &hr);
@@ -997,7 +1330,7 @@ fn build_plan(
                 f.new_page();
                 cont = true;
                 f.mark(Mark::Section { table: t.name.clone(), cont });
-                group_row(&mut f, cw, &format!("Table {} (cont.)", t.name));
+                group_row(&mut f, &format!("Table {} (cont.)", t.name));
                 f.mark(Mark::ColHeader);
                 draw_row(&mut f, &cols, &hr);
                 f.header_on_page = true;
@@ -1007,47 +1340,15 @@ fn build_plan(
         }
         f.mark(Mark::GuestRows { table: t.name.clone(), n: n_on_page });
         f.mark(Mark::Summary { table: t.name.clone() });
-        f.y += 0.6;
-        draw_band(&mut f, cw, &c_lines, 0.9, false);
-        if let Some(dl) = &d_lines {
-            f.y += 0.6;
-            draw_band(&mut f, cw, dl, 0.78, true);
-        }
-        f.y += 1.6;
+        f.y += 0.6 * scale();
+        draw_band(&mut f, &c_lines, 0.9);
+        f.y += 1.4 * scale();
     }
-    // Drop a trailing empty page (e.g. when there are no guests at all).
+    f.end_zone();
     if f.pages.len() > 1 && f.pages.last().map(|p| p.items.is_empty()).unwrap_or(false) {
         f.pages.pop();
     }
-
-    // ---- Allergy-marker key (page 1, bottom), page headers and footers
-    if marker_key {
-        let p = &mut f.pages[0];
-        p.items.push(PlanItem::Dot { x: MARGIN + 1.4, y: h - 10.0, r: 1.2 });
-        p.items.push(PlanItem::Text {
-            text: "on a place card = guest has a dietary requirement / allergy (see list above)".into(),
-            x: MARGIN + 4.2,
-            y: h - 9.0,
-            size: 8.0,
-            bold: false,
-            grey: 0.2,
-        });
-    }
-    let total = f.pages.len();
-    let head = match title.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(t) => format!("{t} \u{2014} Seating plan & menu"),
-        None => "Seating plan & menu".to_string(),
-    };
-    let date_txt = format!("Generated {date}");
-    for (i, p) in f.pages.iter_mut().enumerate() {
-        let head = ellipsize(&head, 12.0, true, w - 2.0 * MARGIN - tw(&date_txt, 8.0, false) - 6.0);
-        p.items.push(PlanItem::Text { text: head, x: MARGIN, y: MARGIN + 3.6, size: 12.0, bold: true, grey: 0.0 });
-        p.items.push(PlanItem::Text { text: date_txt.clone(), x: w - MARGIN - tw(&date_txt, 8.0, false), y: MARGIN + 3.6, size: 8.0, bold: false, grey: 0.35 });
-        p.items.push(PlanItem::Rule { x1: MARGIN, x2: w - MARGIN, y: MARGIN + 5.2, grey: 0.4 });
-        let foot = format!("Page {} of {}", i + 1, total);
-        p.items.push(PlanItem::Text { text: foot.clone(), x: w / 2.0 - tw(&foot, 8.0, false) / 2.0, y: h - 5.0, size: 8.0, bold: false, grey: 0.35 });
-    }
-    PlanLayout { landscape, w, h, pages: f.pages, matrix_included: matrix }
+    Some(f.pages)
 }
 
 // ------------------------------------------------------------- drawing
@@ -1069,7 +1370,12 @@ pub fn today() -> String {
 
 pub struct PlanInfo {
     pub pages: usize,
+    /// Orientation of the Kitchen sheet.
     pub landscape: bool,
+    pub warnings: Vec<String>,
+    /// Body font size reached by each sheet (pt).
+    pub kitchen_pt: f32,
+    pub tables_pt: f32,
 }
 
 /// Write the seating plan PDF.
@@ -1103,17 +1409,17 @@ pub fn render_plan_courses(
     out: &Path,
 ) -> Result<PlanInfo, Box<dyn std::error::Error>> {
     let lay = layout_plan_courses(guests, title, &today(), force_landscape, marker_key, courses);
-    let (doc, p0, l0) = PdfDocument::new("Seating plan", Mm(lay.w), Mm(lay.h), "plan");
+    let (doc, p0, l0) = PdfDocument::new("Seating plan", Mm(lay.pages[0].w), Mm(lay.pages[0].h), "plan");
     let reg = doc.add_builtin_font(BuiltinFont::Helvetica)?;
     let bold = doc.add_builtin_font(BuiltinFont::HelveticaBold)?;
     for (pi, page) in lay.pages.iter().enumerate() {
         let layer = if pi == 0 {
             doc.get_page(p0).get_layer(l0)
         } else {
-            let (p, l) = doc.add_page(Mm(lay.w), Mm(lay.h), "plan");
+            let (p, l) = doc.add_page(Mm(page.w), Mm(page.h), "plan");
             doc.get_page(p).get_layer(l)
         };
-        let fy = |y: f32| Mm(lay.h - y);
+        let fy = |y: f32| Mm(page.h - y);
         for it in &page.items {
             match it {
                 PlanItem::Rect { x, y, w, h, grey } => {
@@ -1132,7 +1438,7 @@ pub fn render_plan_courses(
                 PlanItem::Dot { x, y, r } => {
                     layer.set_fill_color(Color::Greyscale(Greyscale::new(0.0, None)));
                     layer.add_polygon(Polygon {
-                        rings: vec![crate::pdf::circle_points(*x, lay.h - *y, *r)
+                        rings: vec![crate::pdf::circle_points(*x, page.h - *y, *r)
                             .into_iter()
                             .map(|(px, py)| (Point::new(Mm(px), Mm(py)), false))
                             .collect()],
@@ -1156,7 +1462,7 @@ pub fn render_plan_courses(
         }
     }
     doc.save(&mut BufWriter::new(File::create(out)?))?;
-    Ok(PlanInfo { pages: lay.pages.len(), landscape: lay.landscape })
+    Ok(PlanInfo { pages: lay.pages.len(), landscape: lay.landscape, warnings: lay.warnings.clone(), kitchen_pt: lay.kitchen_pt, tables_pt: lay.tables_pt })
 }
 
 #[cfg(test)]
@@ -1217,12 +1523,13 @@ mod tests {
     }
 
     fn check_bounds(l: &PlanLayout) {
+        // adapted: each page has its own size now (sheets choose their own orientation)
         for p in &l.pages {
             for it in &p.items {
                 if let PlanItem::Text { text, x, y, size, bold, .. } = it {
                     assert!(*x >= MARGIN - 0.01, "{text}");
-                    assert!(x + tw(text, *size, *bold) <= l.w - MARGIN + 0.5, "'{text}' overflows");
-                    assert!(*y <= l.h, "{text}");
+                    assert!(x + tw(text, *size, *bold) <= p.w - MARGIN + 0.5, "'{text}' overflows");
+                    assert!(*y <= p.h, "{text}");
                 }
             }
         }
@@ -1238,7 +1545,7 @@ mod tests {
                 .filter_map(|it| match it {
                     PlanItem::Text { text, x, y, size, bold, .. } => {
                         assert!(*size <= 12.0, "'{text}' is {size} pt");
-                        assert!(*size >= 8.0, "'{text}' is {size} pt (too small)");
+                        assert!(*size >= 6.0 - 0.01, "'{text}' is {size} pt (too small)");
                         let w = tw(text, *size, *bold);
                         Some((*x, x + w, y - 0.75 * size * PT, y + 0.2 * size * PT, text.as_str()))
                     }
@@ -1300,34 +1607,28 @@ mod tests {
                 assert!(p.items.iter().any(|it| matches!(it, PlanItem::Text { text, .. } if *text == foot)));
             }
         }
-        // some table section does split across pages somewhere in a long list
-        let l = layout_plan_courses(&big(120, 3), None, "d", false, false, &[]);
+        // some table section does split somewhere in a long list (adapted: with the compact, scaled
+        // layout 3 tables of 40 guests no longer split, so the list is longer: 2 tables of 200)
+        let l = layout_plan_courses(&big(400, 2), None, "d", false, false, &[]);
         check_layout_sane(&l);
-        check_pagination(&l, 3, 40);
+        check_pagination(&l, 2, 200);
         assert!(l.pages.iter().flat_map(|p| &p.marks).any(|m| matches!(m, Mark::Section { cont: true, .. })));
     }
 
     #[test]
     fn auto_orientation_chooses_the_fewest_pages() {
+        // Adapted from the old "fewest pages" test: the plan is now two sheets (Kitchen, Tables), each
+        // choosing its own orientation and font size; the automatic choice never needs more pages than
+        // forcing landscape, nor a smaller font.
         let order: Vec<String> = Vec::new();
         for (n, t) in [(6, 3), (40, 10), (120, 15), (30, 2), (90, 9)] {
             let guests = big(n, t);
-            let a = analyze_ordered(&guests, &order);
             let auto = layout_plan_courses(&guests, None, "d", false, true, &order);
-            let mut min = usize::MAX;
-            for landscape in [false, true] {
-                for pth in [false, true] {
-                    // the matrix is included whenever some orientation fits it, as in the auto layout
-                    let l = build_plan(&a, None, "d", landscape, pth, true, auto.matrix_included, false);
-                    if !auto.matrix_included || (landscape || l.matrix_included) {
-                        min = min.min(l.pages.len());
-                    }
-                }
-            }
-            assert!(auto.pages.len() <= min.max(1) || auto.pages.len() == min, "{n}/{t}: {} vs {min}", auto.pages.len());
-            // forcing landscape never beats the automatic choice
             let forced = layout_plan_courses(&guests, None, "d", true, true, &order);
-            assert!(forced.landscape && auto.pages.len() <= forced.pages.len());
+            assert!(forced.pages.iter().all(|p| p.w > p.h), "forced landscape applies to every sheet");
+            assert!(auto.pages.len() <= forced.pages.len(), "{n}/{t}");
+            assert!(auto.kitchen_pt >= forced.kitchen_pt - 0.01 || auto.pages.len() < forced.pages.len(), "{n}/{t}");
+            assert!(auto.tables_pt >= forced.tables_pt - 0.01 || auto.pages.len() < forced.pages.len(), "{n}/{t}");
         }
     }
 
@@ -1360,8 +1661,12 @@ mod tests {
         assert!(many_tables.matrix_included);
         let fifteen = layout_plan(&big(60, 15), None, "d", false);
         assert!(fifteen.matrix_included, "15 tables still fit at >= 8 mm per column");
+        // Adapted: the matrix columns now shrink with the font (down to about 5 mm at 6 pt), so 25 tables
+        // still fit; it is omitted only when even a 6 pt matrix would not fit the page width.
         let twenty_five = layout_plan(&big(75, 25), None, "d", false);
-        assert!(!twenty_five.matrix_included, "25 tables would need columns narrower than 8 mm");
+        assert!(twenty_five.matrix_included, "25 tables fit at a smaller font");
+        let sixty = layout_plan(&big(180, 60), None, "d", false);
+        assert!(!sixty.matrix_included, "60 tables would need columns narrower than the 6 pt minimum");
         // many course columns still fit and stay inside the margins
         let cols = layout_plan(&[g("A", "1", "A: x; B: y; C: z; D: w")], None, "d", false);
         check_layout_sane(&cols);
@@ -1564,6 +1869,69 @@ mod tests {
         assert!(pos("Starter") < pos("Main") && pos("Main") < pos("Dessert"), "{t:?}");
     }
 
+
+    #[test]
+    fn two_sheets_each_scaled_to_one_page() {
+        let l = layout_plan_courses(&big(30, 4), Some("T"), "d", false, true, &[]);
+        assert_eq!(l.pages.len(), 2, "kitchen sheet + tables sheet");
+        assert_eq!((l.pages[0].sheet, l.pages[1].sheet), ("Kitchen", "Tables"));
+        assert!(l.warnings.is_empty());
+        assert!(l.pages[0].marks.contains(&Mark::Totals) && l.pages[1].marks.iter().any(|m| matches!(m, Mark::Section { .. })));
+        // page header names the sheet
+        let heads: Vec<String> = l.pages.iter().map(|p| p.items.iter().find_map(|i| match i {
+            PlanItem::Text { text, size, .. } if *size == 12.0 => Some(text.clone()), _ => None }).unwrap()).collect();
+        assert!(heads[0].ends_with("Kitchen") && heads[1].ends_with("Tables"), "{heads:?}");
+        check_layout_sane(&l);
+    }
+
+    #[test]
+    fn synthetic_120_guest_list_real_numbers() {
+        // 120 guests over 15 tables with long dish and guest names: the Kitchen sheet fits one page at 9 pt and
+        // the Tables sheet fits one page only at the 6 pt floor (4 columns, a table continuing in the next
+        // column), the real numbers measured here
+        let l = layout_plan_courses(&big(120, 15), None, "d", false, true, &[]);
+        let kitchen = l.pages.iter().filter(|p| p.sheet == "Kitchen").count();
+        assert_eq!(kitchen, 1);
+        assert_eq!(l.pages.len() - kitchen, 1);
+        assert_eq!((l.kitchen_pt, l.tables_pt), (9.0, 6.0));
+        assert!(l.warnings.is_empty());
+        check_layout_sane(&l);
+        check_pagination(&l, 15, 8);
+        // a smaller event fits both sheets on one page each, with no warning
+        let l = layout_plan_courses(&big(60, 8), None, "d", false, true, &[]);
+        assert_eq!(l.pages.len(), 2);
+        assert!(l.warnings.is_empty() && l.tables_pt >= 6.0);
+        check_layout_sane(&l);
+    }
+
+    #[test]
+    fn no_per_table_dietary_band_but_dietary_text_stays_in_the_rows() {
+        let guests = vec![gd("Ann", "1", "Main: x", "Peanuts; Vegan"), g("Ben", "1", "Main: y"), gd("Cy", "2", "", "no pork")];
+        let l = layout_plan(&guests, None, "d", false);
+        let tables_text: Vec<String> = l.pages.iter().filter(|p| p.sheet == "Tables").flat_map(|p| p.items.iter()).filter_map(|i| match i {
+            PlanItem::Text { text, .. } => Some(text.clone()), _ => None }).collect();
+        assert!(!tables_text.iter().any(|t| t.starts_with("! Dietary:")), "the per-table dietary band is gone");
+        let joined = tables_text.join(" ");
+        assert!(joined.contains("! Allergens: Peanuts"), "{joined}");
+        assert!(joined.contains("Diet: Vegan") && joined.contains("! Other: no pork"));
+        // the runner summary (standard portions only) stays, including the "No standard portions" case
+        assert!(joined.contains("Main: y"));
+        assert!(joined.contains("No standard portions") || joined.contains("No menu choices"));
+        // and nothing in the dietary text is ever cut with an ellipsis
+        assert!(!tables_text.iter().any(|t| t.contains('\u{2026}')));
+    }
+
+    #[test]
+    fn overflow_at_the_floor_warns_and_continues_on_more_pages() {
+        let l = layout_plan_courses(&big(400, 10), None, "d", false, true, &[]);
+        assert!(l.pages.len() > 2);
+        assert_eq!(l.tables_pt, 6.0, "never smaller than the floor");
+        assert!(l.warnings.iter().any(|w| w.contains("Tables sheet needs") && w.contains("even at 6 pt")), "{:?}", l.warnings);
+        let t = all_text(&l);
+        assert!(t.iter().any(|x| x.contains("(cont.)")), "continued sections are labelled");
+        check_layout_sane(&l);
+        check_pagination(&l, 10, 40);
+    }
 
     #[test]
     fn plan_pdf_loads() {

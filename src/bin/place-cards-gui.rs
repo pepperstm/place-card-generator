@@ -367,7 +367,13 @@ impl App {
         let title = (!title.is_empty()).then_some(title);
         match place_cards::plan::render_plan_courses(&gs, title, self.plan_landscape, self.allergy_marker, &self.courses, &path) {
             Ok(info) => {
-                self.ok(format!("Wrote seating plan ({} page(s)) to {}", info.pages, path.display()));
+                let mut msg = format!("Wrote seating plan ({} page(s)) to {}", info.pages, path.display());
+                if info.warnings.is_empty() {
+                    self.ok(msg);
+                } else {
+                    msg.push_str(&format!(" | Warning: {}", info.warnings.join("; ")));
+                    self.err(msg);
+                }
                 if let Err(e) = std::process::Command::new("open").arg(&path).spawn() {
                     self.err(format!("PDF written, but could not open it: {e}"));
                 }

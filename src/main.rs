@@ -130,11 +130,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(plan) = &cli.plan {
         let info = place_cards::plan::render_plan_courses(&plan_guests, cli.title.as_deref(), cli.plan_landscape, !cli.no_allergy_marker, &course_list, plan)?;
         println!(
-            "Wrote seating plan ({} page(s), {}) to {}",
+            "Wrote seating plan ({} page(s), Kitchen sheet {} pt / Tables sheet {} pt, {}) to {}",
             info.pages,
+            info.kitchen_pt,
+            info.tables_pt,
             if info.landscape { "landscape" } else { "portrait" },
             plan.display()
         );
+        for w in &info.warnings {
+            eprintln!("warning: {w}");
+        }
         if cli.plan_only {
             return Ok(());
         }

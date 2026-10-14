@@ -142,18 +142,28 @@ column headers repeated. Text is always Helvetica and nothing is larger than 12 
 headers 9, footer and key 8). Long names and dishes wrap up to 3 lines (dietary text up to 6) and then
 end in an ellipsis. Requirements are written as "Allergens: ... · Diet: ... · Other: ..." (empty parts omitted); the page-1 totals list per-allergen counts first, then preferences, then Other. Guests with a dietary entry are shown in bold with a heavier grey band, a "!" marker and a black bar in the margin (clear in black-and-white), and each table gets an extra "! Dietary: ..." band under its summary. There is no seat numbering (no seat data).
 
-### Compact layout and automatic orientation
+### Two sheets, each scaled to one page
 
-The plan is built to use as few pages as possible (it only goes to the kitchen): 10 mm margins, a
-single-line page header, 9 pt rows, and sections that **flow continuously** with no "fresh page"
-rules. Each table is a shaded sub-heading row followed by its guests and runner summary; a table may
-split across a page ("Table N (cont.)") and the column headers are repeated on every page. A
-heading, header row and first guest, or a summary band, is never left alone at the bottom or top of a
-page. Portrait and landscape are both laid out (with and without a column-header row per table) and the
-version with the **fewest pages** is used (a tie goes to portrait); `--plan-landscape` / the GUI
-"landscape" checkbox force landscape. The dish-by-table matrix is drawn whenever its table columns
-can be at least 8 mm wide; otherwise it is left out with a note. The dietary highlighting ("!", bold,
-grey band, black bar) and the allergy-marker key line are kept.
+The plan is two fixed sheets, each starting on a new page and **scaled to fit one page**:
+
+1. **Kitchen**: the dietary requirements & allergies list, kitchen totals (standard + dietary = total),
+   dietary / allergy portions, the dishes-by-table matrix and the allergy key line.
+2. **Tables**: every table's guests with their course dishes and the Dietary / allergies column next to
+   the name (highlighted with "!", bold, a grey band and a black bar), plus the per-table runner summary
+   of **standard** portions ("No standard portions" if everyone there has a requirement). There is no
+   separate per-table dietary band: the dietary text is in each guest's row and is always wrapped in full
+   (never cut with an ellipsis).
+
+Each sheet's text starts at 9 pt and is shrunk in half-point steps (headings scale with it and never
+exceed 12 pt) to a **6 pt floor** until the sheet fits one page. Each sheet picks portrait or landscape
+(whichever allows the larger font; `--plan-landscape` / the GUI checkbox force landscape for both) and
+uses 1-3 (Kitchen) or 1-4 (Tables) newspaper columns where that helps; a table is not split across columns
+unless it is taller than a column, except at the 6 pt floor when splitting saves a page (and multi-column
+layouts are used only when no word would have to be cut). If a sheet still does not fit at 6 pt it
+continues onto more pages ("Table N (cont.)", repeated headers) and a warning is printed by the CLI
+("Tables sheet needs 2 pages even at 6 pt") and shown in the GUI status line. The page header names the
+sheet ("... Seating plan & menu - Kitchen"); the date and "Page X of Y" stay. The dish-by-table matrix is
+dropped (with a note) only if even a 6 pt matrix would not fit the page width.
 
 ## Fonts
 

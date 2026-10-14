@@ -397,6 +397,17 @@ mod tests {
     }
 
     #[test]
+    fn sample_plan_is_exactly_two_pages() {
+        let imp = read_csv_ex(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/guests.csv")), None).unwrap();
+        let l = plan::layout_plan_courses(&imp.guests, Some("Smith Wedding"), "d", false, true, &imp.courses);
+        assert_eq!(l.pages.len(), 2);
+        assert_eq!((l.pages[0].sheet, l.pages[1].sheet), ("Kitchen", "Tables"));
+        assert!(l.warnings.is_empty());
+        assert!(l.pages[0].marks.contains(&plan::Mark::Totals));
+        assert!(l.pages[1].marks.iter().any(|m| matches!(m, plan::Mark::Section { .. })));
+    }
+
+    #[test]
     fn bundled_eb_garamond() {
         use fonts::{Bundled, FontSpec, Fonts};
         assert_eq!(FontSpec::parse("eb garamond bold italic").unwrap(), FontSpec::Bundled(Bundled::BoldItalic));
