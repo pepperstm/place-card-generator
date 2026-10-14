@@ -3,6 +3,7 @@ name = "place-cards"
 version = "0.1.0"
 default-run = "place-cards"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }

@@ -175,3 +175,7 @@ launching the binary pre-loads the sample guests (debug aid, nothing is saved).
 regenerates `AppIcon-1024.png`, `icon-256.png` (used for the window icon) and
 `AppIcon.icns` (built from an iconset under `target/`). `./bundle.sh` copies the
 `.icns` into `dist/Place Cards.app`.
+
+## Licence
+
+The code is released under the MIT Licence; see `LICENSE`. The bundled EB Garamond fonts in `assets/fonts/` are under the SIL Open Font License 1.1 (`assets/fonts/OFL.txt`).
