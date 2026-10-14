@@ -28,8 +28,9 @@ Header row `name,table,menu,dietary`. `name` and `table` are required; `menu` an
 
     name,table,menu,dietary
     Alice Johnson,1,Starter: Soup; Main: Beef; Dessert: Tart,
-    Bob Smith,1,Starter: Salad; Main: Salmon,Gluten free; Shellfish allergy
-    Charlotte Davies,2,,Nut allergy
+    Bob Smith,1,Starter: Salad; Main: Salmon,Gluten; Crustaceans; Molluscs
+    Charlotte Davies,2,,Peanuts; Tree nuts
+    Zoë Müller,4,Main: Beef,Milk; no coriander
 
 ## Layout
 
@@ -52,21 +53,25 @@ Header row `name,table,menu,dietary`. `name` and `table` are required; `menu` an
 
 ## Dietary requirements / allergies
 
-An optional free-text `dietary` field per guest, `;`-separated like menu choices
-("Gluten free; Shellfish allergy"). It appears in the GUI as a "Dietary /
-allergies" column and in the seating plan only. **It is never printed on place
-cards** (guest privacy), and the card preview does not show it.
+Each guest has an optional dietary list, stored as `;`-separated text in the CSV
+`dietary` column and edited in the GUI with tick boxes (**Edit...** in the guest
+table, or **Dietary / allergies...** in the add-guest row):
 
-### Allergy marker on cards
+- **Allergens (the UK/EU 14):** Celery, Gluten (cereals containing gluten),
+  Crustaceans, Eggs, Fish, Lupin, Milk, Molluscs, Mustard, Tree nuts, Peanuts,
+  Sesame, Soya, Sulphites. Hover a box for the full legal name.
+- **Dietary preferences:** Vegetarian, Vegan, Pescatarian, Halal, Kosher.
+- **Other:** a free-text box (several entries separated by `;`; typing ticks the box).
 
-Cards of guests with any dietary / allergy entry get a small solid black dot
-(3.2 mm, vector, so it works with every font) at the bottom-right corner of the
-upright half and the mirrored position on the rotated half, 7 mm in from the cell's right and bottom edges (about 5 mm clear of the cut lines) so it
-never touches the text. Only the dot is printed, never the
-requirement. It is on by default: turn it off with `--no-allergy-marker` on the
-CLI or the "Allergy marker on cards" checkbox in the GUI (remembered between
-launches; the live preview shows it). When on, page 1 of the seating plan ends
-with a one-line key explaining the dot.
+Entries are saved in canonical form: allergens in the order above, then
+preferences, then Other. On CSV import, entries that clearly match a box are
+ticked ("Milk allergy", "Peanut allergy", "Egg allergy", "Gluten free", "Coeliac",
+"Soy", "Sulfites", "Sulphur dioxide", "Sesame seeds", "Dairy", "Dairy free", the full
+legal names, ...). **Ambiguous entries are never guessed: "Nut allergy" (peanuts or
+tree nuts?) and "Shellfish allergy" (crustaceans or molluscs?) stay in Other, unchanged,
+so you can re-tick them properly.** It is shown in the seating plan only (as
+"Allergens: ... · Diet: ... · Other: ..."), never on place cards, apart from the
+optional marker dot below.
 
 ## Seating plan & menu (back of house)
 
@@ -94,7 +99,7 @@ on one page when it fits, otherwise it continues as "Table N (cont.)" with the
 column headers repeated. Text is always Helvetica (body 11 pt, headers 14 pt+);
 long names and dishes wrap up to 3 lines and then end in an ellipsis. Portrait is
 used unless there are more than 3 course columns, more than 8 tables, or
-landscape is forced. Guests with a dietary entry are shown in bold with a heavier grey band, a "!" marker and a black bar in the margin (clear in black-and-white), and each table gets an extra "! Dietary: ..." band under its summary. There is no seat numbering (no seat data).
+landscape is forced. Requirements are written as "Allergens: ... · Diet: ... · Other: ..." (empty parts omitted); the page-1 totals list per-allergen counts first, then preferences, then Other. Guests with a dietary entry are shown in bold with a heavier grey band, a "!" marker and a black bar in the margin (clear in black-and-white), and each table gets an extra "! Dietary: ..." band under its summary. There is no seat numbering (no seat data).
 
 ## Fonts
 

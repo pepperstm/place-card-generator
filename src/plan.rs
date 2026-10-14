@@ -5,6 +5,7 @@
 //! items (all mm, y measured from the top of the page); `render_plan` draws
 //! those items with printpdf. Text is always Helvetica / Helvetica-Bold.
 
+use crate::dietary::{classify, Dietary, Item};
 use crate::fonts::Builtin;
 use crate::{metrics, table_sort_key, Guest};
 use printpdf::*;
@@ -23,6 +24,8 @@ pub struct PGuest {
     pub has_menu: bool,
     /// Dietary requirements / allergies (canonical, first-seen spelling).
     pub dietary: Vec<String>,
+    /// Typed view of `dietary` (allergens / preferences / other).
+    pub diet: Dietary,
 }
 
 pub struct PTable {
@@ -114,6 +117,7 @@ pub fn analyze(guests: &[Guest]) -> Analysis {
     let mut pg = Vec::new();
     let mut no_menu = 0;
     let mut diet: Vec<String> = Vec::new();
+    let mut other_canon: Vec<String> = Vec::new();
     for (g, p) in guests.iter().zip(&parsed) {
         let mut cells = vec![Vec::new(); columns.len()];
         for (c, d) in p {
@@ -131,21 +135,37 @@ pub fn analyze(guests: &[Guest]) -> Analysis {
         if !has_menu {
             no_menu += 1;
         }
-        let mut dietary: Vec<String> = Vec::new();
-        for d in g.dietary.iter().map(|d| d.trim()).filter(|d| !d.is_empty()) {
-            let canon = match diet.iter().find(|x| x.eq_ignore_ascii_case(d)) {
+        // Map entries to the allergen / preference checkboxes; Other entries keep the
+        // first-seen spelling across all guests.
+        let mut d = Dietary::from_entries(&g.dietary);
+        let mut other: Vec<String> = Vec::new();
+        for o in &d.other {
+            let canon = match other_canon.iter().find(|x| x.eq_ignore_ascii_case(o)) {
                 Some(x) => x.clone(),
                 None => {
-                    diet.push(d.to_string());
-                    d.to_string()
+                    other_canon.push(o.clone());
+                    o.clone()
                 }
             };
-            if !dietary.contains(&canon) {
-                dietary.push(canon);
+            if !other.contains(&canon) {
+                other.push(canon);
             }
         }
-        pg.push(PGuest { name: g.name.clone(), table: g.table.clone(), cells, has_menu, dietary });
+        d.other = other;
+        let dietary = d.to_entries();
+        for e in &dietary {
+            if !diet.contains(e) {
+                diet.push(e.clone());
+            }
+        }
+        pg.push(PGuest { name: g.name.clone(), table: g.table.clone(), cells, has_menu, dietary, diet: d });
     }
+    // Allergens first (fixed order), then preferences, then Other (first seen).
+    diet.sort_by_key(|e| match classify(e) {
+        Some(Item::Allergen(i)) => (0, i),
+        Some(Item::Pref(i)) => (1, i),
+        None => (2, 0),
+    });
     // Group by table, ordered by the shared table sort key.
     let mut order: Vec<String> = Vec::new();
     let mut by: HashMap<String, Vec<usize>> = HashMap::new();
@@ -201,9 +221,7 @@ impl Analysis {
     /// requirements but no menu choices come last under `col == None`.
     pub fn diet_portions(&self) -> Vec<DietPortion> {
         let key = |g: &PGuest| {
-            let mut k: Vec<String> = g.dietary.iter().map(|d| d.to_lowercase()).collect();
-            k.sort();
-            k.join("\u{1}")
+            g.diet.key()
         };
         let mut out: Vec<DietPortion> = Vec::new();
         let add = |col: Option<usize>, dish: &str, g: &PGuest, out: &mut Vec<DietPortion>| {
@@ -212,7 +230,7 @@ impl Analysis {
             if let Some(p) = out.iter_mut().find(|p| p.col == col && p.dish == dish && p.key == k) {
                 p.guests.push(who);
             } else {
-                out.push(DietPortion { col, dish: dish.to_string(), combo: g.dietary.join(" + "), key: k, guests: vec![who] });
+                out.push(DietPortion { col, dish: dish.to_string(), combo: g.diet.describe(), key: k, guests: vec![who] });
             }
         };
         for (col, dishes) in self.dishes.iter().enumerate() {
@@ -226,6 +244,29 @@ impl Analysis {
             add(None, NO_MENU, g, &mut out);
         }
         out
+    }
+
+    /// "Allergens: Gluten ×1, Milk ×2 · Diet: Vegan ×1 · Other: no coriander ×1": counts per
+    /// entry, allergens first, then preferences, then Other entries.
+    pub fn diet_totals(&self) -> String {
+        let counts = self.diet_counts(None);
+        let mut groups: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (label, n) in &counts {
+            let g = match classify(label) {
+                Some(Item::Allergen(_)) => 0,
+                Some(Item::Pref(_)) => 1,
+                None => 2,
+            };
+            groups[g].push(format!("{label} \u{d7}{n}"));
+        }
+        let names = ["Allergens", "Diet", "Other"];
+        groups
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(i, v)| format!("{}: {}", names[i], v.join(", ")))
+            .collect::<Vec<_>>()
+            .join(" \u{b7} ")
     }
 
     /// (dietary entry, count) in first-seen order for `subset` guests (all if None).
@@ -271,7 +312,7 @@ impl Analysis {
             .map(|g| {
                 let dishes: Vec<&str> = g.cells.iter().flatten().map(|d| d.as_str()).collect();
                 let dishes = if dishes.is_empty() { "no menu choices recorded".to_string() } else { dishes.join(", ") };
-                format!("{} \u{2014} {} \u{2014} {}", g.name, dishes, g.dietary.join(" + "))
+                format!("{} \u{2014} {} \u{2014} {}", g.name, dishes, g.diet.describe())
             })
             .collect();
         (courses, (!who.is_empty()).then(|| format!("Dietary: {}", who.join("; "))))
@@ -571,7 +612,7 @@ pub fn layout_plan_ex(guests: &[Guest], title: Option<&str>, date: &str, force_l
         f.text("No dietary requirements recorded.", MARGIN, base, BODY + 1.0, true, 0.0);
         f.y = base + 5.0;
     } else {
-        let totals = a.diet_counts(None).iter().map(|(d, n)| format!("{d} \u{d7}{n}")).collect::<Vec<_>>().join(" \u{b7} ");
+        let totals = a.diet_totals();
         for l in wrap(&format!("Totals: {totals}"), BODY + 1.0, true, cw, 4) {
             let base = f.y + (BODY + 1.0) * PT;
             f.text(&l, MARGIN, base, BODY + 1.0, true, 0.0);
@@ -587,7 +628,7 @@ pub fn layout_plan_ex(guests: &[Guest], title: Option<&str>, date: &str, force_l
         for (i, (tname, g)) in flagged.iter().enumerate() {
             let row = make_row_ex(
                 &dcols,
-                &[tname.to_string(), g.name.clone(), format!("! {}", g.dietary.join(", "))],
+                &[tname.to_string(), g.name.clone(), format!("! {}", g.diet.describe())],
                 BODY + 1.0,
                 vec![true, false, true],
                 true,
@@ -823,8 +864,8 @@ pub fn layout_plan_ex(guests: &[Guest], title: Option<&str>, date: &str, force_l
     f.new_page();
     // Columns: guest name | one per course (incl. Other) | Dietary / allergies.
     let n_cols = a.columns.len();
-    let diet_w = if landscape { 62.0 } else { 42.0 };
-    let name_w = if n_cols == 0 { cw - diet_w } else if landscape { 55.0 } else { 38.0 };
+    let diet_w = if landscape { 75.0 } else { 52.0 };
+    let name_w = if n_cols == 0 { cw - diet_w } else if landscape { 52.0 } else { 34.0 };
     let course_w = if n_cols == 0 { 0.0 } else { (cw - name_w - diet_w) / n_cols as f32 };
     let mut cols = vec![Col { x: MARGIN, w: name_w }];
     for i in 0..n_cols {
@@ -847,7 +888,7 @@ pub fn layout_plan_ex(guests: &[Guest], title: Option<&str>, date: &str, force_l
                     txt.push(if cell.is_empty() { "\u{2014}".into() } else { cell.join(", ") });
                 }
                 let flagged = !g.dietary.is_empty();
-                txt.push(if flagged { format!("! {}", g.dietary.join(", ")) } else { "\u{2014}".into() });
+                txt.push(if flagged { format!("! {}", g.diet.describe()) } else { "\u{2014}".into() });
                 let mut bolds = vec![false; cols.len()];
                 if flagged {
                     // bold name and requirements, heavier band and a black bar: clear in black and white
@@ -855,7 +896,8 @@ pub fn layout_plan_ex(guests: &[Guest], title: Option<&str>, date: &str, force_l
                     *bolds.last_mut().unwrap() = true;
                 }
                 let fill = if flagged { Some(0.8) } else { (i % 2 == 1).then_some(0.95) };
-                make_row_ex(&cols, &txt, BODY, bolds, flagged, fill, vec![false; cols.len()], MAX_LINES)
+                // requirements are safety-critical: allow up to 6 lines before any ellipsis
+                make_row_ex(&cols, &txt, BODY, bolds, flagged, fill, vec![false; cols.len()], if flagged { 6 } else { MAX_LINES })
             })
             .collect();
         let (c_text, d_text) = a.summary_parts(&t.guests);
@@ -1203,11 +1245,13 @@ mod tests {
             gd("C", "2", "Main: y", " ; "),
             gd("D", "2", "", "Vegan; vegan"),
         ]);
-        assert_eq!(a.diet, vec!["Nut allergy", "Vegan"]); // first-seen spelling, case-insensitive merge
+        // Changed deliberately: entries are ordered allergens, then preferences, then Other
+        // (so Vegan now precedes the Other entry "Nut allergy"), case-insensitive merge.
+        assert_eq!(a.diet, vec!["Vegan", "Nut allergy"]);
         assert_eq!(a.guests[1].dietary, vec!["Nut allergy"]);
         assert!(a.guests[2].dietary.is_empty()); // only separators -> nothing
         assert_eq!(a.guests[3].dietary, vec!["Vegan"]); // duplicate within one guest counted once
-        assert_eq!(a.diet_counts(None), vec![("Nut allergy".to_string(), 2), ("Vegan".to_string(), 2)]);
+        assert_eq!(a.diet_counts(None), vec![("Vegan".to_string(), 2), ("Nut allergy".to_string(), 2)]);
         // Table 1: A (Main x, dietary) and B (no menu, dietary) -> no standard plates.
         // (Changed deliberately: the course line now counts STANDARD portions only,
         // and the dietary band lists each modified plate per guest.)
@@ -1215,12 +1259,12 @@ mod tests {
         assert_eq!(c, "No standard portions");
         assert_eq!(
             d.as_deref(),
-            Some("Dietary: A \u{2014} x \u{2014} Nut allergy + Vegan; B \u{2014} no menu choices recorded \u{2014} Nut allergy")
+            Some("Dietary: A \u{2014} x \u{2014} Diet: Vegan \u{b7} Other: Nut allergy; B \u{2014} no menu choices recorded \u{2014} Other: Nut allergy")
         );
         // Table 2: C is standard (Main y); D has no menu but a requirement
         let (c, d) = a.summary_parts(&a.tables[1].guests);
         assert_eq!(c, "Main: y \u{d7}1");
-        assert_eq!(d.as_deref(), Some("Dietary: D \u{2014} no menu choices recorded \u{2014} Vegan"));
+        assert_eq!(d.as_deref(), Some("Dietary: D \u{2014} no menu choices recorded \u{2014} Diet: Vegan"));
     }
 
     fn mixed() -> Vec<Guest> {
@@ -1267,11 +1311,12 @@ mod tests {
         let salmon: Vec<_> = p.iter().filter(|x| x.dish == "Salmon").collect();
         assert_eq!(salmon.len(), 1, "same combination must merge into one row");
         assert_eq!(salmon[0].guests.len(), 2);
-        assert_eq!(salmon[0].combo, "Gluten free + Shellfish allergy"); // first-seen spelling and order
+        // "Gluten free" now maps to the Gluten allergen; "Shellfish allergy" is ambiguous so stays in Other
+        assert_eq!(salmon[0].combo, "Allergens: Gluten \u{b7} Other: Shellfish allergy");
         // a guest's whole combination is one portion, not split
-        assert!(!p.iter().any(|x| x.combo == "Gluten free"));
+        assert!(!p.iter().any(|x| x.combo == "Allergens: Gluten"));
         // Zoe's Beef and Tart are separate dish rows
-        assert_eq!(p.iter().filter(|x| x.combo == "Nut allergy").count(), 2);
+        assert_eq!(p.iter().filter(|x| x.combo == "Other: Nut allergy").count(), 2);
     }
 
     #[test]
@@ -1279,7 +1324,7 @@ mod tests {
         let a = analyze(&mixed());
         let p = a.diet_portions();
         let last = p.last().unwrap();
-        assert_eq!((last.col, last.dish.as_str(), last.combo.as_str()), (None, NO_MENU, "Vegetarian"));
+        assert_eq!((last.col, last.dish.as_str(), last.combo.as_str()), (None, NO_MENU, "Diet: Vegetarian"));
         assert_eq!(last.guests, vec![("Di".to_string(), "2".to_string())]);
         let t = all_text(&layout_plan(&mixed(), None, "d", false));
         assert!(t.join(" ").contains("No menu choices"));
@@ -1297,6 +1342,36 @@ mod tests {
     }
 
     #[test]
+    fn plan_shows_allergens_diet_and_other_parts_and_ordered_totals() {
+        let guests = vec![
+            gd("Ann", "1", "Main: x", "Vegan; Milk; Peanuts; no coriander"),
+            gd("Ben", "1", "Main: y", "Sesame"),
+            gd("Cat", "2", "Main: x", "Halal"),
+            gd("Dan", "2", "Main: y", "NO CORIANDER"),
+        ];
+        let a = analyze(&guests);
+        // canonical order: allergens (fixed order), preferences, then Other
+        assert_eq!(a.guests[0].dietary, vec!["Milk", "Peanuts", "Vegan", "no coriander"]);
+        assert_eq!(a.guests[0].diet.describe(), "Allergens: Milk, Peanuts \u{b7} Diet: Vegan \u{b7} Other: no coriander");
+        assert_eq!(a.guests[2].diet.describe(), "Diet: Halal"); // empty parts omitted
+        // totals: per allergen first (fixed order), then preferences, then Other
+        assert_eq!(
+            a.diet_totals(),
+            "Allergens: Milk \u{d7}1, Peanuts \u{d7}1, Sesame \u{d7}1 \u{b7} Diet: Vegan \u{d7}1, Halal \u{d7}1 \u{b7} Other: no coriander \u{d7}2"
+        );
+        // the same text reaches the document, in each place
+        let joined = all_text(&layout_plan(&guests, None, "d", false)).join(" ");
+        assert!(joined.contains("! Allergens: Milk, Peanuts"), "page-1 list / table column");
+        assert!(joined.contains("Totals: Allergens: Milk"), "{joined}");
+        assert!(joined.contains("Diet: Halal"));
+        assert!(joined.contains("Other: no coriander"));
+        // grouping uses the canonical sets, not the spelling
+        let same = analyze(&[gd("A", "1", "Main: x", "Peanuts; Vegan"), gd("B", "1", "Main: x", "vegan; peanut allergy")]);
+        assert_eq!(same.diet_portions().len(), 1);
+        assert_eq!(same.diet_portions()[0].guests.len(), 2);
+    }
+
+    #[test]
     fn plan_dietary_section() {
         // with entries: the section comes first on page 1, above Kitchen totals
         let l = layout_plan(&[gd("A", "1", "Main: x", "Nut allergy"), g("B", "1", "Main: y")], None, "d", false);
@@ -1307,7 +1382,7 @@ mod tests {
         let t = all_text(&l);
         assert!(t.iter().any(|x| x == "Dietary requirements & allergies"));
         assert!(!t.iter().any(|x| x == "No dietary requirements recorded."));
-        assert!(t.iter().any(|x| x.contains("! Nut allergy")));
+        assert!(t.iter().any(|x| x.contains("! Other: Nut allergy")));
         assert!(t.iter().any(|x| x.starts_with("Dietary /")));
         // with none: one explicit line, and the column is still present
         let l = layout_plan(&[g("A", "1", "Main: x")], None, "d", false);

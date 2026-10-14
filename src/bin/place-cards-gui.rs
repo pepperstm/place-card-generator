@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use eframe::egui::{self, Color32, RichText};
+use place_cards::dietary::{Dietary, ALLERGENS, PREFS};
 use place_cards::fonts::{self, Builtin, Bundled, FontSpec, Fonts, Measurer, SystemFont};
 use place_cards::pdf::{self, PlacedText};
 use place_cards::{Guest, parse_menu, read_csv, sort_by_table, table_sort_key, write_csv};
@@ -8,12 +9,44 @@ use place_cards::{Guest, parse_menu, read_csv, sort_by_table, table_sort_key, wr
 const BAD: Color32 = Color32::from_rgb(255, 214, 214);
 const ERR: Color32 = Color32::from_rgb(200, 30, 30);
 
+/// Editable dietary requirements: tick boxes for the allergens and preferences plus Other text.
+#[derive(Default, Clone)]
+struct DietEdit {
+    allergens: [bool; 14],
+    prefs: [bool; 5],
+    other_on: bool,
+    other_text: String,
+}
+
+impl DietEdit {
+    fn from_entries(entries: &[String]) -> Self {
+        let d = Dietary::from_entries(entries);
+        DietEdit { allergens: d.allergens, prefs: d.prefs, other_on: !d.other.is_empty(), other_text: d.other.join("; ") }
+    }
+    fn to_dietary(&self) -> Dietary {
+        Dietary {
+            allergens: self.allergens,
+            prefs: self.prefs,
+            other: if self.other_on { parse_menu(&self.other_text) } else { Vec::new() },
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.to_dietary().is_empty()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Editing {
+    Row(usize),
+    New,
+}
+
 #[derive(Default, Clone)]
 struct Row {
     name: String,
     table: String,
     menu: String,
-    dietary: String,
+    diet: DietEdit,
 }
 
 impl Row {
@@ -21,7 +54,7 @@ impl Row {
         self.name.trim().is_empty()
             && self.table.trim().is_empty()
             && self.menu.trim().is_empty()
-            && self.dietary.trim().is_empty()
+            && self.diet.is_empty()
     }
     fn is_bad(&self) -> bool {
         !self.is_blank() && (self.name.trim().is_empty() || self.table.trim().is_empty())
@@ -31,7 +64,7 @@ impl Row {
             name: self.name.trim().into(),
             table: self.table.trim().into(),
             menu: parse_menu(&self.menu),
-            dietary: parse_menu(&self.dietary),
+            dietary: self.diet.to_dietary().to_entries(),
         }
     }
 }
@@ -51,6 +84,7 @@ struct App {
     sys_fonts: Arc<Mutex<Option<Vec<SystemFont>>>>,
     font_filter: String,
     selected: Option<usize>,
+    editing: Option<Editing>,
     page_view: bool,
     measurer: Measurer,
     pfonts: PreviewFonts,
@@ -91,6 +125,7 @@ impl App {
             sys_fonts,
             font_filter: String::new(),
             selected: None,
+            editing: None,
             page_view: false,
             measurer: Measurer::new(),
             pfonts: PreviewFonts::new(),
@@ -117,7 +152,7 @@ impl App {
         if let Ok(gs) = read_csv(csv) {
             self.rows = gs
                 .into_iter()
-                .map(|g| Row { name: g.name, table: g.table, menu: g.menu.join("; "), dietary: g.dietary.join("; ") })
+                .map(|g| Row { name: g.name, table: g.table, menu: g.menu.join("; "), diet: DietEdit::from_entries(&g.dietary) })
                 .collect();
         }
         self.title = "Smith Wedding".into();
@@ -132,6 +167,10 @@ impl App {
             menu: FontSpec::Builtin(Builtin::TimesItalic),
         };
         self.selected = Some(1);
+        // PLACE_CARDS_DEMO_EDIT=1 also opens the dietary editor for the selected guest.
+        if std::env::var_os("PLACE_CARDS_DEMO_EDIT").is_some() {
+            self.editing = Some(Editing::Row(1));
+        }
         self.page_view = std::env::var("PLACE_CARDS_DEMO").as_deref() == Ok("page");
         self.demo = true;
     }
@@ -171,7 +210,7 @@ impl App {
                     name: g.name,
                     table: g.table,
                     menu: g.menu.join("; "),
-                    dietary: g.dietary.join("; "),
+                    diet: DietEdit::from_entries(&g.dietary),
                 }));
                 self.ok(format!("Imported {n} guests from {}", path.display()));
             }
@@ -424,8 +463,12 @@ impl eframe::App for App {
                 submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let r = field(ui, &mut self.new.menu, 260.0, "Menu (optional, ; separated)", false);
                 submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let r = field(ui, &mut self.new.dietary, 180.0, "(none)", false);
-                submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Dietary / allergies\u{2026}").on_hover_text("Tick allergens and dietary preferences").clicked() {
+                    self.editing = Some(Editing::New);
+                }
+                if !self.new.diet.is_empty() {
+                    ui.label(self.new.diet.to_dietary().summary());
+                }
                 if ui.button("Add guest").clicked() {
                     submit = true;
                 }
@@ -465,8 +508,26 @@ impl eframe::App for App {
                         let mut focus = false;
                         focus |= field(ui, &mut r.name, 200.0, "Name", bad_name).gained_focus();
                         focus |= field(ui, &mut r.table, 60.0, "Table", bad_table).gained_focus();
-                        focus |= field(ui, &mut r.menu, 300.0, "(no menu)", false).gained_focus();
-                        focus |= field(ui, &mut r.dietary, 180.0, "(none)", false).gained_focus();
+                        focus |= field(ui, &mut r.menu, 240.0, "(no menu)", false).gained_focus();
+                        // compact read-only summary plus an editor popup
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Edit\u{2026}").on_hover_text("Allergens and dietary preferences").clicked() {
+                                self.editing = Some(Editing::Row(i));
+                                focus = true;
+                            }
+                            let summary = r.diet.to_dietary().summary();
+                            let text = if r.diet.is_empty() { RichText::new(&summary).weak() } else { RichText::new(&summary).strong() };
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(140.0, 20.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_max_width(140.0);
+                                    ui.add(egui::Label::new(text).truncate())
+                                },
+                            )
+                            .inner
+                            .on_hover_text(r.diet.to_dietary().describe());
+                        });
                         if focus {
                             self.selected = Some(i);
                         }
@@ -481,8 +542,10 @@ impl eframe::App for App {
                     Some(s) if s > i => Some(s - 1),
                     o => o,
                 };
+                self.editing = None;
             }
         });
+        self.diet_window(ctx);
     }
 }
 
@@ -628,6 +691,80 @@ impl PreviewFonts {
 }
 
 impl App {
+    /// Popup editor for one guest's dietary requirements (14 allergens, preferences, Other).
+    fn diet_window(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.editing else { return };
+        let (title, diet): (String, &mut DietEdit) = match target {
+            Editing::Row(i) if i < self.rows.len() => {
+                let name = self.rows[i].name.trim().to_string();
+                (
+                    format!("Dietary requirements \u{2014} {}", if name.is_empty() { "guest".into() } else { name }),
+                    &mut self.rows[i].diet,
+                )
+            }
+            Editing::New => ("Dietary requirements \u{2014} new guest".into(), &mut self.new.diet),
+            _ => {
+                self.editing = None;
+                return;
+            }
+        };
+        let mut open = true;
+        let mut done = false;
+        egui::Window::new(title)
+            .id(egui::Id::new("diet_editor"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(440.0)
+            .default_height(340.0)
+            .vscroll(true)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Allergens").strong());
+                ui.weak("The 14 major allergens (UK / EU)");
+                egui::Grid::new("allergen_grid").num_columns(3).spacing([22.0, 6.0]).show(ui, |ui| {
+                    for (i, (label, full)) in ALLERGENS.iter().enumerate() {
+                        ui.checkbox(&mut diet.allergens[i], *label).on_hover_text(*full);
+                        if i % 3 == 2 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                ui.separator();
+                ui.label(RichText::new("Dietary preferences").strong());
+                ui.horizontal_wrapped(|ui| {
+                    for (i, label) in PREFS.iter().enumerate() {
+                        ui.checkbox(&mut diet.prefs[i], *label);
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut diet.other_on, "Other");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut diet.other_text)
+                            .hint_text("e.g. no coriander (separate several with ;)")
+                            .desired_width(280.0),
+                    );
+                    if r.changed() && !diet.other_text.trim().is_empty() {
+                        diet.other_on = true; // typing ticks the box
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Clear all").clicked() {
+                        *diet = DietEdit::default();
+                    }
+                    if ui.button(RichText::new("Done").strong()).clicked() {
+                        done = true;
+                    }
+                    ui.weak(diet.to_dietary().summary());
+                });
+            });
+        if done || !open {
+            self.editing = None;
+        }
+    }
+
     /// The guest to preview and its position in the generated order (for page view).
     fn preview_guests(&self) -> (Vec<Guest>, usize) {
         let mut idx: Vec<(usize, Guest)> = self

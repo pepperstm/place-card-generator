@@ -1,6 +1,7 @@
 //! Shared code for the place-cards CLI and GUI.
 
 pub mod cff;
+pub mod dietary;
 pub mod fonts;
 pub mod metrics;
 pub mod pdf;
@@ -52,10 +53,18 @@ pub fn read_csv(path: &Path) -> Result<Vec<Guest>, Box<dyn std::error::Error>> {
             return Err(format!("line {line}: both name and table are required").into());
         }
         let menu = menu_i.and_then(|m| rec.get(m)).map(parse_menu).unwrap_or_default();
-        let dietary = diet_i.and_then(|d| rec.get(d)).map(parse_menu).unwrap_or_default();
+        // canonical form: allergen/preference checkboxes in fixed order, then Other entries
+        let dietary = dietary::Dietary::from_entries(&diet_i.and_then(|d| rec.get(d)).map(parse_menu).unwrap_or_default()).to_entries();
         guests.push(Guest { name, table, menu, dietary });
     }
     Ok(guests)
+}
+
+impl Guest {
+    /// Typed view of the dietary entries.
+    pub fn dietary_view(&self) -> dietary::Dietary {
+        dietary::Dietary::from_entries(&self.dietary)
+    }
 }
 
 /// Write guests to a CSV file with header `name,table,menu,dietary`.
@@ -63,7 +72,7 @@ pub fn write_csv(path: &Path, guests: &[Guest]) -> Result<(), Box<dyn std::error
     let mut w = csv::Writer::from_path(path)?;
     w.write_record(["name", "table", "menu", "dietary"])?;
     for g in guests {
-        w.write_record([g.name.as_str(), g.table.as_str(), g.menu.join("; ").as_str(), g.dietary.join("; ").as_str()])?;
+        w.write_record([g.name.as_str(), g.table.as_str(), g.menu.join("; ").as_str(), dietary::Dietary::from_entries(&g.dietary).to_entries().join("; ").as_str()])?;
     }
     w.flush()?;
     Ok(())
@@ -187,9 +196,19 @@ mod tests {
         write_csv(&out, &sample()).unwrap();
         assert!(std::fs::read_to_string(&out).unwrap().starts_with("name,table,menu,dietary"));
         let back = read_csv(&out).unwrap();
-        assert_eq!(back[1].dietary, vec!["Gluten free", "Shellfish allergy"]);
+        // canonical labels in the fixed order (Tree nuts comes before Peanuts)
+        assert_eq!(back[1].dietary, vec!["Gluten", "Crustaceans", "Molluscs"]);
         assert_eq!(back[2].menu.len(), 0);
-        assert_eq!(back[2].dietary, vec!["Nut allergy"]); // allergy but no menu
+        assert_eq!(back[2].dietary, vec!["Tree nuts", "Peanuts"]); // allergies but no menu
+        assert_eq!(back[5].dietary, vec!["no pork"]); // Other-only entry
+        assert_eq!(back[7].dietary, vec!["Milk", "no coriander"]);
+        // legacy free text is mapped on import; ambiguous entries stay in Other unchanged
+        let old = dir.join("pc_legacy.csv");
+        std::fs::write(&old, "name,table,dietary\nA,1,\"Gluten free; Nut allergy; Shellfish allergy; milk allergy; Vegan\"\n").unwrap();
+        assert_eq!(read_csv(&old).unwrap()[0].dietary, vec!["Gluten", "Milk", "Vegan", "Nut allergy", "Shellfish allergy"]);
+        let out2 = dir.join("pc_legacy_out.csv");
+        write_csv(&out2, &read_csv(&old).unwrap()).unwrap();
+        assert!(std::fs::read_to_string(&out2).unwrap().contains("Gluten; Milk; Vegan; Nut allergy; Shellfish allergy"));
     }
 
     fn diet_guest(name: &str, menu: &str) -> Guest {
@@ -219,7 +238,8 @@ mod tests {
                 assert!(a.y_mm < cy && b.y_mm > cy, "upright half is the bottom half");
             }
         }
-        assert_eq!(with, 4);
+        // Bob, Charlotte, Rajesh, Frank (Other-only), Maria (Vegan) and Zoe: 6 of the 8 sample guests
+        assert_eq!(with, 6);
     }
 
     #[test]

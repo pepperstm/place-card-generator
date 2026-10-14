@@ -1,9 +1,9 @@
 name,table,menu,dietary
 Alice Johnson,1,Starter: Soup; Main: Beef; Dessert: Tart,
-Bob Smith,1,Starter: Salad; Main: Salmon; Dessert: Cheesecake,Gluten free; Shellfish allergy
-Charlotte Davies,2,,Nut allergy
+Bob Smith,1,Starter: Salad; Main: Salmon; Dessert: Cheesecake,Gluten; Crustaceans; Molluscs
+Charlotte Davies,2,,Peanuts; Tree nuts
 Dr. Rajesh Patel,2,Main: Vegetarian curry,Vegetarian
 Emily Brown,3,Starter: Soup; Main: Chicken,
-Frank O'Connor,3,,
-Maria Fernanda de los Angeles Montgomery-Wentworth-Smythe III,4,Starter: Pate; Main: Lamb; Dessert: Sticky toffee pudding,
-Zoë Müller,4,Main: Beef; Dessert: Tart,nut allergy
+Frank O'Connor,3,,no pork
+Maria Fernanda de los Angeles Montgomery-Wentworth-Smythe III,4,Starter: Pate; Main: Lamb; Dessert: Sticky toffee pudding,Vegan
+Zoë Müller,4,Main: Beef; Dessert: Tart,Milk; no coriander

@@ -27,6 +27,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+# Take the version from Cargo.toml so the bundle always matches the crate.
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
 # Ad-hoc sign so Apple Silicon will launch it.
 codesign --force --deep -s - "$APP" 2>/dev/null || true
 # let Finder refresh the icon
