@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use std::io::{self, BufRead, Write};
 use place_cards::fonts::{FontSpec, Fonts};
-use place_cards::{Guest, parse_menu, pdf, read_csv, sort_by_table};
+use place_cards::{courses, Guest, pdf, read_csv_ex, sort_by_table};
 use std::path::PathBuf;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -45,6 +45,11 @@ struct Cli {
     /// Do not draw the small allergy marker on cards of guests with dietary entries.
     #[arg(long)]
     no_allergy_marker: bool,
+    /// The event's courses: a count ("3") or names ("Starter,Main,Dessert"). Unlabelled menu entries
+    /// ("Soup; Beef; Tart") are assigned to them by position. Default: inferred from the CSV
+    /// (labels, else the longest menu row), or 3 courses.
+    #[arg(long, value_name = "N|NAMES")]
+    courses: Option<String>,
     /// Sort guests before layout.
     #[arg(long, value_enum)]
     sort: Option<SortBy>,
@@ -60,7 +65,7 @@ fn prompt(label: &str) -> io::Result<Option<String>> {
     Ok(Some(s.trim().to_string()))
 }
 
-fn interactive() -> io::Result<Vec<Guest>> {
+fn interactive(course_list: &[String]) -> io::Result<Vec<Guest>> {
     let mut guests = Vec::new();
     println!("Enter guests one at a time. Leave Name blank to finish.");
     loop {
@@ -75,7 +80,13 @@ fn interactive() -> io::Result<Vec<Guest>> {
                 None => return Ok(guests),
             }
         };
-        let menu = parse_menu(&prompt("Menu choices (optional, ';' separated, blank to skip): ")?.unwrap_or_default());
+        println!("  Courses: {} (type dishes in this order, ';' separated; leave a slot empty to skip a course)", course_list.join(", "));
+        let raw = prompt("Menu choices (optional, blank to skip): ")?.unwrap_or_default();
+        let a = courses::assign_row(&courses::split_slots(&raw), course_list);
+        if !a.overflow.is_empty() {
+            eprintln!("warning: more entries than courses; \"{}\" kept under Other", a.overflow.join("\", \""));
+        }
+        let menu = a.entries;
         guests.push(Guest { name, table, menu, dietary: Vec::new() });
     }
     Ok(guests)
@@ -90,9 +101,22 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let mut guests = match &cli.csv {
-        Some(p) => read_csv(p)?,
-        None => interactive()?,
+    let base: Option<Vec<String>> = cli.courses.as_deref().map(courses::parse_courses_arg).transpose()?;
+    let (mut guests, course_list) = match &cli.csv {
+        Some(p) => {
+            let imp = read_csv_ex(p, base.as_deref())?;
+            for w in &imp.warnings {
+                eprintln!("warning: {w}");
+            }
+            if imp.inferred {
+                eprintln!("Detected {} courses: {}", imp.courses.len(), imp.courses.join(", "));
+            }
+            (imp.guests, imp.courses)
+        }
+        None => {
+            let c = base.clone().unwrap_or_else(|| courses::default_names(3));
+            (interactive(&c)?, c)
+        }
     };
     if guests.is_empty() {
         return Err("no guests supplied; nothing to write".into());
@@ -104,7 +128,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         sort_by_table(&mut guests);
     }
     if let Some(plan) = &cli.plan {
-        let info = place_cards::plan::render_plan_ex(&plan_guests, cli.title.as_deref(), cli.plan_landscape, !cli.no_allergy_marker, plan)?;
+        let info = place_cards::plan::render_plan_courses(&plan_guests, cli.title.as_deref(), cli.plan_landscape, !cli.no_allergy_marker, &course_list, plan)?;
         println!(
             "Wrote seating plan ({} page(s), {}) to {}",
             info.pages,

@@ -1,6 +1,7 @@
 //! Shared code for the place-cards CLI and GUI.
 
 pub mod cff;
+pub mod courses;
 pub mod dietary;
 pub mod fonts;
 pub mod metrics;
@@ -27,9 +28,29 @@ pub fn parse_menu(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// What a CSV import found.
+pub struct CsvImport {
+    pub guests: Vec<Guest>,
+    /// The event's courses (inferred, or the caller's with any new labels appended).
+    pub courses: Vec<String>,
+    /// True when no `base` courses were given and the courses were inferred from the file.
+    pub inferred: bool,
+    /// Problems worth showing (e.g. extra unlabelled menu entries that ended up in "Other").
+    pub warnings: Vec<String>,
+}
+
 /// Read guests from a CSV file with header `name,table,menu[,dietary]`
 /// (columns are found by header name; `menu` and `dietary`/`allergies` are optional).
+/// Menu entries are labelled with their course (see `read_csv_ex`).
 pub fn read_csv(path: &Path) -> Result<Vec<Guest>, Box<dyn std::error::Error>> {
+    Ok(read_csv_ex(path, None)?.guests)
+}
+
+/// Like `read_csv`, with course handling. Labelled menu entries ("Main: Beef") go to that course;
+/// unlabelled ones ("Soup; Beef; Tart") are assigned by position to the event's courses, which are
+/// `base` if given (unknown labels are appended) or inferred from the file. Menu entries come out
+/// labelled, in the original order.
+pub fn read_csv_ex(path: &Path, base: Option<&[String]>) -> Result<CsvImport, Box<dyn std::error::Error>> {
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
         .trim(csv::Trim::All)
@@ -40,7 +61,7 @@ pub fn read_csv(path: &Path) -> Result<Vec<Guest>, Box<dyn std::error::Error>> {
     let table_i = col("table").ok_or("CSV header must contain a 'table' column")?;
     let menu_i = col("menu");
     let diet_i = ["dietary", "allergies", "dietary/allergies"].iter().find_map(|n| col(n));
-    let mut guests = Vec::new();
+    let mut raw: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
     for (i, rec) in rdr.records().enumerate() {
         let rec = rec?;
         let line = i + 2;
@@ -52,12 +73,26 @@ pub fn read_csv(path: &Path) -> Result<Vec<Guest>, Box<dyn std::error::Error>> {
         if name.is_empty() || table.is_empty() {
             return Err(format!("line {line}: both name and table are required").into());
         }
-        let menu = menu_i.and_then(|m| rec.get(m)).map(parse_menu).unwrap_or_default();
+        let slots = courses::split_slots(menu_i.and_then(|m| rec.get(m)).unwrap_or(""));
         // canonical form: allergen/preference checkboxes in fixed order, then Other entries
         let dietary = dietary::Dietary::from_entries(&diet_i.and_then(|d| rec.get(d)).map(parse_menu).unwrap_or_default()).to_entries();
-        guests.push(Guest { name, table, menu, dietary });
+        raw.push((name, table, slots, dietary));
     }
-    Ok(guests)
+    let all_slots: Vec<Vec<String>> = raw.iter().map(|r| r.2.clone()).collect();
+    let course_list = courses::infer_courses(&all_slots, base);
+    let mut guests = Vec::new();
+    let mut warnings = Vec::new();
+    for (name, table, slots, dietary) in raw {
+        let a = courses::assign_row(&slots, &course_list);
+        if !a.overflow.is_empty() {
+            warnings.push(format!(
+                "{name}: more menu entries than courses; \"{}\" kept under Other",
+                a.overflow.join("\", \"")
+            ));
+        }
+        guests.push(Guest { name, table, menu: a.entries, dietary });
+    }
+    Ok(CsvImport { guests, courses: course_list, inferred: base.is_none(), warnings })
 }
 
 impl Guest {
@@ -298,6 +333,67 @@ mod tests {
         assert!(!l.pages[0].items.iter().any(|i| matches!(i, plan::PlanItem::Dot { .. })));
         let l = plan::layout_plan_ex(&sample(), None, "d", false, false);
         assert!(!l.pages[0].items.iter().any(|i| matches!(i, plan::PlanItem::Dot { .. })));
+    }
+
+    #[test]
+    fn csv_positional_import_and_roundtrip() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("pc_pos.csv");
+        std::fs::write(
+            &p,
+            "name,table,menu\nA,1,Soup; Beef; Tart\nB,1,; Fish; Pud\nC,2,Soup;;Tart\nD,2,Soup; Chicken\nE,3,\nF,3,Main: Lamb; Soup\nG,3,a; b; c; d; e\n",
+        )
+        .unwrap();
+        // no labels anywhere: course count from the longest row (5 entries) -> the 5-course defaults
+        let nolabel = dir.join("pc_nolabel.csv");
+        std::fs::write(&nolabel, "name,table,menu\nA,1,Soup; Beef; Tart\nB,1,a; b; c; d; e\n").unwrap();
+        let imp = read_csv_ex(&nolabel, None).unwrap();
+        assert_eq!(imp.courses, courses::default_names(5));
+        assert!(imp.inferred && imp.warnings.is_empty());
+        assert_eq!(imp.guests[0].menu, ["Starter: Soup", "Soup: Beef", "Fish: Tart"]); // positional on 5 courses
+        // a labelled entry (row F) must not shrink the count implied by positional rows (G has 5)
+        assert_eq!(read_csv_ex(&p, None).unwrap().courses, courses::default_names(5));
+        // the same file with the user's 3 courses: overflow goes to Other with a warning
+        let three = courses::default_names(3);
+        let imp = read_csv_ex(&p, Some(&three)).unwrap();
+        assert!(!imp.inferred && imp.courses == three);
+        let m = |i: usize| imp.guests[i].menu.clone();
+        assert_eq!(m(0), ["Starter: Soup", "Main: Beef", "Dessert: Tart"]);
+        assert_eq!(m(1), ["Main: Fish", "Dessert: Pud"]); // skipped starter
+        assert_eq!(m(2), ["Starter: Soup", "Dessert: Tart"]); // skipped middle course
+        assert_eq!(m(3), ["Starter: Soup", "Main: Chicken"]); // trailing omitted
+        assert!(m(4).is_empty());
+        assert_eq!(m(5), ["Main: Lamb", "Starter: Soup"]); // mixed: labelled claims Main
+        assert_eq!(m(6), ["Starter: a", "Main: b", "Dessert: c", "d", "e"]); // overflow kept as Other
+        assert_eq!(imp.warnings.len(), 1);
+        assert!(imp.warnings[0].contains("G") && imp.warnings[0].contains("d"), "{:?}", imp.warnings);
+        // Save CSV writes labelled entries, and re-importing gives identical data
+        let out = dir.join("pc_pos_out.csv");
+        write_csv(&out, &imp.guests).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("Starter: Soup; Main: Beef; Dessert: Tart"));
+        let again = read_csv_ex(&out, Some(&three)).unwrap();
+        for (a, b) in imp.guests.iter().zip(&again.guests) {
+            assert_eq!((&a.name, &a.table, &a.menu, &a.dietary), (&b.name, &b.table, &b.menu, &b.dietary));
+        }
+        // unknown labels are added after the known courses, not lost
+        let u = dir.join("pc_unknown.csv");
+        std::fs::write(&u, "name,table,menu\nA,1,Cheese: Brie; Soup\n").unwrap();
+        let imp = read_csv_ex(&u, Some(&three)).unwrap();
+        assert_eq!(imp.courses, ["Starter", "Main", "Dessert", "Cheese"]);
+        assert_eq!(imp.guests[0].menu, ["Cheese: Brie", "Starter: Soup"]);
+    }
+
+    #[test]
+    fn old_labelled_csv_parses_as_before() {
+        let imp = read_csv_ex(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/guests.csv")), None).unwrap();
+        assert_eq!(imp.courses, ["Starter", "Main", "Dessert"]);
+        assert!(imp.warnings.is_empty());
+        let g = &imp.guests;
+        assert_eq!(g[0].menu, ["Starter: Soup", "Main: Beef", "Dessert: Tart"]);
+        assert_eq!(g[3].menu, ["Main: Vegetarian curry"]);
+        assert_eq!(g[6].menu, ["Starter: Pate", "Main: Lamb", "Dessert: Sticky toffee pudding"]);
+        assert!(g[2].menu.is_empty() && g[5].menu.is_empty());
     }
 
     #[test]

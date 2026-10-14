@@ -89,6 +89,12 @@ pub fn split_choice(choice: &str) -> Option<(Option<String>, String)> {
 }
 
 pub fn analyze(guests: &[Guest]) -> Analysis {
+    analyze_ordered(guests, &[])
+}
+
+/// Like `analyze`; course columns follow `order` (the event's courses, case-insensitive) and
+/// any other labels come after, in first-seen order. Courses nobody chose get no column.
+pub fn analyze_ordered(guests: &[Guest], order: &[String]) -> Analysis {
     // Pass 1: columns and canonical spellings.
     let mut courses: Vec<String> = Vec::new();
     let mut has_other = false;
@@ -102,6 +108,11 @@ pub fn analyze(guests: &[Guest]) -> Analysis {
                 _ => {}
             }
         }
+    }
+    // event course order first (stable), then any other labels as first seen
+    {
+        let pos = |c: &str| order.iter().position(|o| crate::courses::same_name(o, c)).unwrap_or(usize::MAX);
+        courses.sort_by_key(|c| pos(c)); // stable: unknown labels keep first-seen order after the known ones
     }
     let mut columns = courses.clone();
     if has_other {
@@ -588,7 +599,19 @@ pub fn layout_plan(guests: &[Guest], title: Option<&str>, date: &str, force_land
 /// Like `layout_plan`; with `marker_key` a one-line key for the place-card
 /// allergy marker is added at the bottom of page 1 (only if anyone has dietary entries).
 pub fn layout_plan_ex(guests: &[Guest], title: Option<&str>, date: &str, force_landscape: bool, marker_key: bool) -> PlanLayout {
-    let a = analyze(guests);
+    layout_plan_courses(guests, title, date, force_landscape, marker_key, &[])
+}
+
+/// Like `layout_plan_ex`, with course columns in the event's course order.
+pub fn layout_plan_courses(
+    guests: &[Guest],
+    title: Option<&str>,
+    date: &str,
+    force_landscape: bool,
+    marker_key: bool,
+    courses: &[String],
+) -> PlanLayout {
+    let a = analyze_ordered(guests, courses);
     let marker_key = marker_key && a.guests.iter().any(|g| !g.dietary.is_empty());
     let n_tables = a.tables.len();
     let landscape = force_landscape || a.columns.len() > 3 || n_tables > 8;
@@ -1039,7 +1062,19 @@ pub fn render_plan_ex(
     marker_key: bool,
     out: &Path,
 ) -> Result<PlanInfo, Box<dyn std::error::Error>> {
-    let lay = layout_plan_ex(guests, title, &today(), force_landscape, marker_key);
+    render_plan_courses(guests, title, force_landscape, marker_key, &[], out)
+}
+
+/// Write the seating plan PDF with course columns in the event's course order.
+pub fn render_plan_courses(
+    guests: &[Guest],
+    title: Option<&str>,
+    force_landscape: bool,
+    marker_key: bool,
+    courses: &[String],
+    out: &Path,
+) -> Result<PlanInfo, Box<dyn std::error::Error>> {
+    let lay = layout_plan_courses(guests, title, &today(), force_landscape, marker_key, courses);
     let (doc, p0, l0) = PdfDocument::new("Seating plan", Mm(lay.w), Mm(lay.h), "plan");
     let reg = doc.add_builtin_font(BuiltinFont::Helvetica)?;
     let bold = doc.add_builtin_font(BuiltinFont::HelveticaBold)?;
@@ -1407,6 +1442,21 @@ mod tests {
         let l = layout_plan(&guests[..8], None, "d", false);
         assert!(!l.landscape);
         check_bounds(&l);
+    }
+
+    #[test]
+    fn plan_columns_follow_course_order() {
+        // first-seen order would be Dessert, Main, Starter
+        let guests = vec![g("A", "1", "Dessert: Tart; Main: Beef"), g("B", "1", "Starter: Soup; Cheese: Brie")];
+        let first_seen = analyze(&guests);
+        assert_eq!(first_seen.columns, vec!["Dessert", "Main", "Starter", "Cheese"]);
+        let order: Vec<String> = ["Starter", "Main", "Dessert"].iter().map(|s| s.to_string()).collect();
+        let a = analyze_ordered(&guests, &order);
+        assert_eq!(a.columns, vec!["Starter", "Main", "Dessert", "Cheese"]); // unknown labels after, first-seen
+        let l = layout_plan_courses(&guests, None, "d", false, false, &order);
+        let t = all_text(&l);
+        let pos = |name: &str| t.iter().position(|x| x == name);
+        assert!(pos("Starter") < pos("Main") && pos("Main") < pos("Dessert"), "{t:?}");
     }
 
     #[test]

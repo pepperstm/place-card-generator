@@ -19,6 +19,47 @@ Generate printable fold-over (tent) table place cards as an A4 PDF.
 Options: `-o/--output` (default `cards.pdf`), `--title` (small event title above
 each name), `--sort table` (by table number, then name; numeric tables first).
 
+## Courses and menu entries
+
+An event has 1 to 6 **courses** (default 3). Default names by count: 1 Main; 2 Main, Dessert;
+3 Starter, Main, Dessert; 4 Starter, Soup, Main, Dessert; 5 Starter, Soup, Fish, Main,
+Dessert; 6 Canapés, Starter, Soup, Fish, Main, Dessert. In the GUI, the **Courses** row near
+the event title has a count selector and editable names (remembered between launches). Changing
+the count resets the names to that count's defaults unless you have edited them; once edited they
+are kept (courses are added/removed at the end). Dishes are re-keyed by course name, so nothing
+moves to the wrong course, and the dishes of a removed course are kept as "Other" entries.
+
+Each guest has **one field per course**: just type "Soup", "Beef", "Tart" (leave a course blank
+to skip it). The small **v** button next to a field lists the dishes already used for that course,
+so spelling stays consistent. Cards still print "Starter: Soup" etc.
+
+### Menu column in CSV
+
+The `menu` column is a `;`-separated list. Entries can be labelled or positional:
+
+    name,table,menu
+    Ann,1,Starter: Soup; Main: Beef; Dessert: Tart     <- labelled
+    Bob,1,Soup; Beef; Tart                             <- positional: Starter, Main, Dessert
+    Cy,2,; Beef; Tart                                  <- empty slot skips the Starter
+    Di,2,Soup;;Tart                                    <- skips the Main
+    Ed,3,Soup; Chicken                                 <- trailing course omitted
+    Flo,3,Main: Lamb; Soup; Tart                       <- labelled ones claim their course, the rest fill the others in order
+
+Rules: labelled entries ("Main: Beef") go to that course (case-insensitive); an unknown label adds a
+new course after the known ones. Unlabelled entries fill the event's courses by position (mixed rows:
+the courses not claimed by a label, in order). Extra unlabelled entries are kept under "Other" and the
+import warns, naming the guest.
+
+When importing, the courses are **inferred**: the longest menu row with any unlabelled entries sets
+the count (that count's default names, at most 6), and any course labels in the file are added to
+those. Known names keep the standard order Canapés, Starter, Soup, Fish, Main, Dessert. A fully
+labelled file uses just its labels. The GUI status line says e.g. "Detected 3 courses: Starter,
+Main, Dessert"; edit the names or count afterwards. Your own courses are kept when you have edited
+them or are appending to an existing list (only new labels are added). Save CSV writes labelled
+entries ("Starter: Soup; Main: Beef") so files are unambiguous. The CLI prints the detected courses
+and accepts `--courses 3` or `--courses "Starter,Main,Dessert"` to override. The seating plan's course
+columns follow the event's course order.
+
 ## CSV format
 
 Header row `name,table,menu,dietary`. `name` and `table` are required; `menu` and

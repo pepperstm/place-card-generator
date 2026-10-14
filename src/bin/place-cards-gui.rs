@@ -4,7 +4,8 @@ use eframe::egui::{self, Color32, RichText};
 use place_cards::dietary::{Dietary, ALLERGENS, PREFS};
 use place_cards::fonts::{self, Builtin, Bundled, FontSpec, Fonts, Measurer, SystemFont};
 use place_cards::pdf::{self, PlacedText};
-use place_cards::{Guest, parse_menu, read_csv, sort_by_table, table_sort_key, write_csv};
+use place_cards::courses::{default_names, same_name, split_label, MAX_COURSES, STANDARD};
+use place_cards::{read_csv_ex, Guest, parse_menu, sort_by_table, table_sort_key, write_csv};
 
 const BAD: Color32 = Color32::from_rgb(255, 214, 214);
 const ERR: Color32 = Color32::from_rgb(200, 30, 30);
@@ -45,25 +46,77 @@ enum Editing {
 struct Row {
     name: String,
     table: String,
-    menu: String,
+    /// One dish text per event course (same order as `App::courses`); ';' separates several dishes.
+    menu: Vec<String>,
+    /// Menu entries that belong to no course (kept as they were, shown in an "Other" column).
+    extra: Vec<String>,
     diet: DietEdit,
 }
 
 impl Row {
+    /// Build a row from a guest: labelled entries go to the matching course field, the rest to `extra`.
+    fn from_guest(g: &Guest, courses: &[String]) -> Row {
+        let mut r = Row { name: g.name.clone(), table: g.table.clone(), menu: vec![String::new(); courses.len()], extra: Vec::new(), diet: DietEdit::from_entries(&g.dietary) };
+        for e in &g.menu {
+            match split_label(e) {
+                Some((l, d)) if !d.is_empty() => match courses.iter().position(|c| same_name(c, &l)) {
+                    Some(i) => {
+                        if !r.menu[i].is_empty() {
+                            r.menu[i].push_str("; ");
+                        }
+                        r.menu[i].push_str(&d);
+                    }
+                    None => r.extra.push(e.clone()),
+                },
+                _ => r.extra.push(e.clone()),
+            }
+        }
+        r
+    }
+
+    /// Re-key the dish fields after the course list changed (matched by name; dishes of removed
+    /// courses are kept as labelled "extra" entries so nothing is lost).
+    fn remap(&mut self, old: &[String], new: &[String]) {
+        let mut menu = vec![String::new(); new.len()];
+        for (i, text) in self.menu.iter().enumerate() {
+            if text.trim().is_empty() {
+                continue;
+            }
+            match old.get(i).and_then(|o| new.iter().position(|n| same_name(n, o))) {
+                Some(j) if menu[j].is_empty() => menu[j] = text.clone(),
+                _ => {
+                    let label = old.get(i).cloned().unwrap_or_default();
+                    for d in parse_menu(text) {
+                        self.extra.push(if label.is_empty() { d } else { format!("{label}: {d}") });
+                    }
+                }
+            }
+        }
+        self.menu = menu;
+    }
+
     fn is_blank(&self) -> bool {
         self.name.trim().is_empty()
             && self.table.trim().is_empty()
-            && self.menu.trim().is_empty()
+            && self.menu.iter().all(|m| m.trim().is_empty())
+            && self.extra.is_empty()
             && self.diet.is_empty()
     }
     fn is_bad(&self) -> bool {
         !self.is_blank() && (self.name.trim().is_empty() || self.table.trim().is_empty())
     }
-    fn to_guest(&self) -> Guest {
+    fn to_guest(&self, courses: &[String]) -> Guest {
+        let mut menu = Vec::new();
+        for (i, name) in courses.iter().enumerate() {
+            for d in parse_menu(self.menu.get(i).map(String::as_str).unwrap_or("")) {
+                menu.push(if name.trim().is_empty() { d } else { format!("{}: {}", name.trim(), d) });
+            }
+        }
+        menu.extend(self.extra.iter().cloned());
         Guest {
             name: self.name.trim().into(),
             table: self.table.trim().into(),
-            menu: parse_menu(&self.menu),
+            menu,
             dietary: self.diet.to_dietary().to_entries(),
         }
     }
@@ -85,10 +138,25 @@ struct App {
     font_filter: String,
     selected: Option<usize>,
     editing: Option<Editing>,
+    /// The event's courses (names, in order) and whether the user has edited the names.
+    courses: Vec<String>,
+    courses_edited: bool,
     page_view: bool,
     measurer: Measurer,
     pfonts: PreviewFonts,
     demo: bool,
+}
+
+fn load_courses(storage: Option<&dyn eframe::Storage>) -> (Vec<String>, bool) {
+    if let Some(st) = storage {
+        if let Some(s) = st.get_string("courses") {
+            let v: Vec<String> = s.lines().map(|l| l.to_string()).collect();
+            if !v.is_empty() && v.len() <= 12 {
+                return (v, st.get_string("courses_edited").as_deref() == Some("1"));
+            }
+        }
+    }
+    (default_names(3), false)
 }
 
 const FONT_KEYS: [&str; 4] = ["font_title", "font_name", "font_table", "font_menu"];
@@ -126,6 +194,8 @@ impl App {
             font_filter: String::new(),
             selected: None,
             editing: None,
+            courses: load_courses(cc.storage).0,
+            courses_edited: load_courses(cc.storage).1,
             page_view: false,
             measurer: Measurer::new(),
             pfonts: PreviewFonts::new(),
@@ -149,11 +219,13 @@ impl App {
     /// never persisted. Has no effect when the variable is unset.
     fn apply_demo(&mut self) {
         let csv = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/guests.csv"));
-        if let Ok(gs) = read_csv(csv) {
-            self.rows = gs
-                .into_iter()
-                .map(|g| Row { name: g.name, table: g.table, menu: g.menu.join("; "), diet: DietEdit::from_entries(&g.dietary) })
-                .collect();
+        if let Ok(imp) = read_csv_ex(csv, None) {
+            self.courses = imp.courses.clone();
+            self.rows = imp.guests.iter().map(|g| Row::from_guest(g, &imp.courses)).collect();
+        }
+        // PLACE_CARDS_DEMO_COURSES=N switches the event to N courses (dishes are re-keyed by name).
+        if let Some(n) = std::env::var("PLACE_CARDS_DEMO_COURSES").ok().and_then(|s| s.parse::<usize>().ok()) {
+            self.set_courses(default_names(n));
         }
         self.title = "Smith Wedding".into();
         let georgia = std::path::PathBuf::from(
@@ -185,14 +257,42 @@ impl App {
     }
 
     fn valid_guests(&self) -> Vec<Guest> {
-        self.rows.iter().filter(|r| !r.is_blank()).map(Row::to_guest).collect()
+        self.rows.iter().filter(|r| !r.is_blank()).map(|r| r.to_guest(&self.courses)).collect()
+    }
+
+    /// Switch to a new course list: dishes are re-keyed by course name (removed courses keep their
+    /// dishes as labelled extra entries).
+    fn set_courses(&mut self, new: Vec<String>) {
+        let old = std::mem::replace(&mut self.courses, new);
+        let new = self.courses.clone();
+        for r in self.rows.iter_mut().chain(std::iter::once(&mut self.new)) {
+            r.remap(&old, &new);
+        }
+    }
+
+    /// Change the number of courses. Names reset to that count's defaults unless the user has edited
+    /// them; edited names are kept (extra courses get the next unused standard name or "Course N").
+    fn change_count(&mut self, n: usize) {
+        let n = n.clamp(1, MAX_COURSES);
+        if !self.courses_edited {
+            self.set_courses(default_names(n));
+        } else {
+            let mut v = self.courses.clone();
+            v.truncate(n);
+            while v.len() < n {
+                let next = STANDARD.iter().find(|s| !v.iter().any(|x| same_name(x, s))).map(|s| s.to_string());
+                v.push(next.unwrap_or_else(|| format!("Course {}", v.len() + 1)));
+            }
+            self.set_courses(v);
+        }
     }
 
     fn add_new(&mut self) {
         if self.new.name.trim().is_empty() || self.new.table.trim().is_empty() {
             self.err("Enter both a name and a table number to add a guest.");
         } else {
-            self.rows.push(std::mem::take(&mut self.new));
+            let blank = Row { menu: vec![String::new(); self.courses.len()], ..Row::default() };
+            self.rows.push(std::mem::replace(&mut self.new, blank));
             self.status.clear();
         }
         self.focus_name = true;
@@ -200,19 +300,30 @@ impl App {
 
     fn import(&mut self) {
         let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).pick_file() else { return };
-        match read_csv(&path) {
-            Ok(gs) => {
-                let n = gs.len();
+        // Keep the user's courses when they edited them or when appending to an existing list.
+        let keep = self.courses_edited || (!self.replace_on_import && !self.rows.is_empty());
+        let base = keep.then(|| self.courses.clone());
+        match read_csv_ex(&path, base.as_deref()) {
+            Ok(imp) => {
+                let n = imp.guests.len();
                 if self.replace_on_import {
                     self.rows.clear();
                 }
-                self.rows.extend(gs.into_iter().map(|g| Row {
-                    name: g.name,
-                    table: g.table,
-                    menu: g.menu.join("; "),
-                    diet: DietEdit::from_entries(&g.dietary),
-                }));
-                self.ok(format!("Imported {n} guests from {}", path.display()));
+                if imp.courses != self.courses {
+                    self.set_courses(imp.courses.clone());
+                }
+                if !keep {
+                    self.courses_edited = false;
+                }
+                self.rows.extend(imp.guests.iter().map(|g| Row::from_guest(g, &self.courses)));
+                let mut msg = format!("Imported {n} guests from {}. ", path.display());
+                msg.push_str(&format!("{} {} courses: {}", if keep { "Using" } else { "Detected" }, self.courses.len(), self.courses.join(", ")));
+                if !imp.warnings.is_empty() {
+                    msg.push_str(&format!(" | Warning: {}", imp.warnings.join("; ")));
+                    self.err(msg);
+                } else {
+                    self.ok(msg);
+                }
             }
             Err(e) => self.err(format!("Import failed: {e}")),
         }
@@ -254,7 +365,7 @@ impl App {
         };
         let title = self.title.trim();
         let title = (!title.is_empty()).then_some(title);
-        match place_cards::plan::render_plan_ex(&gs, title, self.plan_landscape, self.allergy_marker, &path) {
+        match place_cards::plan::render_plan_courses(&gs, title, self.plan_landscape, self.allergy_marker, &self.courses, &path) {
             Ok(info) => {
                 self.ok(format!("Wrote seating plan ({} page(s)) to {}", info.pages, path.display()));
                 if let Err(e) = std::process::Command::new("open").arg(&path).spawn() {
@@ -302,6 +413,47 @@ impl App {
             Err(e) => self.err(format!("PDF generation failed: {e}")),
         }
     }
+}
+
+/// Distinct dishes already typed for each course (case-insensitive, first spelling), sorted.
+fn dish_lists(rows: &[Row], new: &Row, n: usize) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = vec![Vec::new(); n];
+    for r in rows.iter().chain(std::iter::once(new)) {
+        for (c, text) in r.menu.iter().enumerate().take(n) {
+            for d in parse_menu(text) {
+                if !out[c].iter().any(|x| x.eq_ignore_ascii_case(&d)) {
+                    out[c].push(d);
+                }
+            }
+        }
+    }
+    for v in &mut out {
+        v.sort_by_key(|s| s.to_lowercase());
+    }
+    out
+}
+
+/// One per-course dish field with a small dropdown listing the dishes already used for that course.
+fn course_field(ui: &mut egui::Ui, text: &mut String, dishes: &[String], course: &str) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let r = ui.add_sized([92.0, 22.0], egui::TextEdit::singleline(text).desired_width(92.0).hint_text(course));
+        ui.menu_button("v", |ui| {
+            if dishes.is_empty() {
+                ui.weak("No dishes yet");
+            }
+            for d in dishes {
+                if ui.button(d).clicked() {
+                    *text = d.clone();
+                    ui.close_menu();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Dishes already used for this course");
+        r
+    })
+    .inner
 }
 
 fn field(ui: &mut egui::Ui, text: &mut String, width: f32, hint: &str, bad: bool) -> egui::Response {
@@ -358,6 +510,8 @@ impl eframe::App for App {
         if self.demo {
             return;
         }
+        storage.set_string("courses", self.courses.join("\n"));
+        storage.set_string("courses_edited", if self.courses_edited { "1" } else { "0" }.to_string());
         storage.set_string("allergy_marker", if self.allergy_marker { "1" } else { "0" }.to_string());
         let slots = [&self.fonts.title, &self.fonts.name, &self.fonts.table, &self.fonts.menu];
         for (spec, key) in slots.into_iter().zip(FONT_KEYS) {
@@ -387,7 +541,7 @@ impl eframe::App for App {
         self.pfonts.begin_frame();
         egui::SidePanel::right("preview")
             .resizable(true)
-            .default_width(460.0)
+            .default_width(380.0)
             .min_width(250.0)
             .show(ctx, |ui| self.preview_ui(ui));
         self.pfonts.end_frame(ctx);
@@ -402,6 +556,36 @@ impl eframe::App for App {
                         .desired_width(320.0),
                 );
             });
+            // Event courses: a count plus editable names (dishes are typed per course, no "Main:" needed)
+            let mut new_count = None;
+            let mut reset = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Courses:");
+                let n = self.courses.len();
+                egui::ComboBox::from_id_salt("course_count").width(40.0).selected_text(n.to_string()).show_ui(ui, |ui| {
+                    for k in 1..=MAX_COURSES {
+                        if ui.selectable_label(n == k, k.to_string()).clicked() {
+                            new_count = Some(k);
+                        }
+                    }
+                });
+                for name in self.courses.iter_mut() {
+                    if ui.add_sized([84.0, 22.0], egui::TextEdit::singleline(name)).changed() {
+                        self.courses_edited = true;
+                    }
+                }
+                if self.courses_edited && ui.small_button("Reset names").on_hover_text("Back to the default names for this many courses").clicked() {
+                    reset = true;
+                }
+            });
+            if let Some(k) = new_count {
+                self.change_count(k);
+            }
+            if reset {
+                self.courses_edited = false;
+                let n = self.courses.len().min(MAX_COURSES);
+                self.set_courses(default_names(n));
+            }
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Import CSV\u{2026}").clicked() {
@@ -452,6 +636,8 @@ impl eframe::App for App {
 
             ui.label(RichText::new("Add guest").strong());
             let mut submit = false;
+            // dishes already used per course (all guests), for the little dropdown next to each field
+            let dishes = dish_lists(&self.rows, &self.new, self.courses.len());
             ui.horizontal_wrapped(|ui| {
                 let r = field(ui, &mut self.new.name, 200.0, "Name", false);
                 if self.focus_name {
@@ -461,8 +647,13 @@ impl eframe::App for App {
                 submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let r = field(ui, &mut self.new.table, 60.0, "Table", false);
                 submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let r = field(ui, &mut self.new.menu, 260.0, "Menu (optional, ; separated)", false);
-                submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if self.new.menu.len() != self.courses.len() {
+                    self.new.menu.resize(self.courses.len(), String::new());
+                }
+                for (c, name) in self.courses.iter().enumerate() {
+                    let r = course_field(ui, &mut self.new.menu[c], &dishes[c], name);
+                    submit |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                }
                 if ui.button("Dietary / allergies\u{2026}").on_hover_text("Tick allergens and dietary preferences").clicked() {
                     self.editing = Some(Editing::New);
                 }
@@ -484,13 +675,19 @@ impl eframe::App for App {
                 if self.rows.is_empty() {
                     ui.weak("No guests yet. Add some above or import a CSV.");
                 }
-                egui::Grid::new("guests").num_columns(6).spacing([8.0, 6.0]).striped(true).show(ui, |ui| {
+                let show_other = self.rows.iter().any(|r| !r.extra.is_empty());
+                egui::Grid::new("guests").num_columns(5 + self.courses.len() + show_other as usize).spacing([8.0, 6.0]).striped(true).show(ui, |ui| {
                     ui.strong("#");
                     ui.strong("");
                     ui.strong("Name");
                     ui.strong("Table No.");
-                    ui.strong("Menu choices");
                     ui.strong("Dietary / allergies");
+                    for name in &self.courses {
+                        ui.strong(name);
+                    }
+                    if show_other {
+                        ui.strong("Other");
+                    }
                     ui.end_row();
                     for (i, r) in self.rows.iter_mut().enumerate() {
                         let bad = r.is_bad();
@@ -506,9 +703,8 @@ impl eframe::App for App {
                             delete = Some(i);
                         }
                         let mut focus = false;
-                        focus |= field(ui, &mut r.name, 200.0, "Name", bad_name).gained_focus();
+                        focus |= field(ui, &mut r.name, 150.0, "Name", bad_name).gained_focus();
                         focus |= field(ui, &mut r.table, 60.0, "Table", bad_table).gained_focus();
-                        focus |= field(ui, &mut r.menu, 240.0, "(no menu)", false).gained_focus();
                         // compact read-only summary plus an editor popup
                         ui.horizontal(|ui| {
                             if ui.small_button("Edit\u{2026}").on_hover_text("Allergens and dietary preferences").clicked() {
@@ -518,16 +714,26 @@ impl eframe::App for App {
                             let summary = r.diet.to_dietary().summary();
                             let text = if r.diet.is_empty() { RichText::new(&summary).weak() } else { RichText::new(&summary).strong() };
                             ui.allocate_ui_with_layout(
-                                egui::vec2(140.0, 20.0),
+                                egui::vec2(110.0, 20.0),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    ui.set_max_width(140.0);
+                                    ui.set_max_width(110.0);
                                     ui.add(egui::Label::new(text).truncate())
                                 },
                             )
                             .inner
                             .on_hover_text(r.diet.to_dietary().describe());
                         });
+                        if r.menu.len() != self.courses.len() {
+                            r.menu.resize(self.courses.len(), String::new());
+                        }
+                        for (c, name) in self.courses.iter().enumerate() {
+                            focus |= course_field(ui, &mut r.menu[c], &dishes[c], name).gained_focus();
+                        }
+                        if show_other {
+                            ui.add_sized([110.0, 20.0], egui::Label::new(RichText::new(r.extra.join("; ")).weak()).truncate())
+                                .on_hover_text("Menu entries that match no course");
+                        }
                         if focus {
                             self.selected = Some(i);
                         }
@@ -772,7 +978,7 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, r)| !r.is_blank())
-            .map(|(i, r)| (i, r.to_guest()))
+            .map(|(i, r)| (i, r.to_guest(&self.courses)))
             .collect();
         if self.sort {
             idx.sort_by_cached_key(|(_, g)| table_sort_key(g));
@@ -782,7 +988,7 @@ impl App {
             let g = if n.is_blank() {
                 Guest { name: "Guest Name".into(), table: "1".into(), menu: parse_menu("Starter: Soup; Main: Beef"), dietary: vec![] }
             } else {
-                n.to_guest()
+                n.to_guest(&self.courses)
             };
             return (vec![g], 0);
         }
