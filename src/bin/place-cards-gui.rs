@@ -5,7 +5,7 @@ use place_cards::dietary::{Dietary, ALLERGENS, PREFS};
 use place_cards::fonts::{self, Builtin, Bundled, FontSpec, Fonts, Measurer, SystemFont};
 use place_cards::pdf::{self, PlacedText};
 use place_cards::courses::{default_names, same_name, split_label, MAX_COURSES, STANDARD};
-use place_cards::{read_csv_ex, Guest, parse_menu, sort_by_table, table_sort_key, write_csv};
+use place_cards::{next_free_table, read_csv_opts, write_csv_ex, Guest, TableNote, parse_menu, sort_by_table, table_sort_key};
 
 const BAD: Color32 = Color32::from_rgb(255, 214, 214);
 const ERR: Color32 = Color32::from_rgb(200, 30, 30);
@@ -17,12 +17,14 @@ struct DietEdit {
     prefs: [bool; 5],
     other_on: bool,
     other_text: String,
+    /// Free-text pre-order note for the kitchen (a modified plate).
+    notes: String,
 }
 
 impl DietEdit {
     fn from_entries(entries: &[String]) -> Self {
         let d = Dietary::from_entries(entries);
-        DietEdit { allergens: d.allergens, prefs: d.prefs, other_on: !d.other.is_empty(), other_text: d.other.join("; ") }
+        DietEdit { allergens: d.allergens, prefs: d.prefs, other_on: !d.other.is_empty(), other_text: d.other.join("; "), notes: String::new() }
     }
     fn to_dietary(&self) -> Dietary {
         Dietary {
@@ -32,7 +34,18 @@ impl DietEdit {
         }
     }
     fn is_empty(&self) -> bool {
-        self.to_dietary().is_empty()
+        self.to_dietary().is_empty() && self.notes.trim().is_empty()
+    }
+    /// Compact summary for the table cell: dietary summary, plus the note.
+    fn summary(&self) -> String {
+        let d = self.to_dietary();
+        let note = self.notes.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" / ");
+        match (d.is_empty(), note.is_empty()) {
+            (true, true) => "(none)".into(),
+            (false, true) => d.summary(),
+            (true, false) => format!("Note: {note}"),
+            (false, false) => format!("{} \u{b7} Note: {note}", d.summary()),
+        }
     }
 }
 
@@ -56,7 +69,7 @@ struct Row {
 impl Row {
     /// Build a row from a guest: labelled entries go to the matching course field, the rest to `extra`.
     fn from_guest(g: &Guest, courses: &[String]) -> Row {
-        let mut r = Row { name: g.name.clone(), table: g.table.clone(), menu: vec![String::new(); courses.len()], extra: Vec::new(), diet: DietEdit::from_entries(&g.dietary) };
+        let mut r = Row { name: g.name.clone(), table: g.table.clone(), menu: vec![String::new(); courses.len()], extra: Vec::new(), diet: DietEdit { notes: g.notes.clone(), ..DietEdit::from_entries(&g.dietary) } };
         for e in &g.menu {
             match split_label(e) {
                 Some((l, d)) if !d.is_empty() => match courses.iter().position(|c| same_name(c, &l)) {
@@ -114,6 +127,7 @@ impl Row {
         }
         menu.extend(self.extra.iter().cloned());
         Guest {
+            notes: self.diet.notes.trim().to_string(),
             name: self.name.trim().into(),
             table: self.table.trim().into(),
             menu,
@@ -141,6 +155,9 @@ struct App {
     /// The event's courses (names, in order) and whether the user has edited the names.
     courses: Vec<String>,
     courses_edited: bool,
+    /// Shared "for the table" orders and unmatched pre-order notes (from a Collins food sheet import).
+    table_notes: Vec<TableNote>,
+    unmatched_notes: Vec<(String, String)>,
     page_view: bool,
     measurer: Measurer,
     pfonts: PreviewFonts,
@@ -194,6 +211,8 @@ impl App {
             font_filter: String::new(),
             selected: None,
             editing: None,
+            table_notes: Vec::new(),
+            unmatched_notes: Vec::new(),
             courses: load_courses(cc.storage).0,
             courses_edited: load_courses(cc.storage).1,
             page_view: false,
@@ -218,8 +237,13 @@ impl App {
     /// non-default fonts and select the second guest. Fonts chosen this way are
     /// never persisted. Has no effect when the variable is unset.
     fn apply_demo(&mut self) {
-        let csv = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/guests.csv"));
-        if let Ok(imp) = read_csv_ex(csv, None) {
+        // PLACE_CARDS_DEMO_CSV=<file> loads that CSV instead of the sample guests.csv.
+        let custom = std::env::var("PLACE_CARDS_DEMO_CSV").ok();
+        let csv = custom.as_deref().map(std::path::Path::new).unwrap_or(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/guests.csv")));
+        if let Ok(imp) = read_csv_opts(csv, None, "1") {
+            self.table_notes = imp.table_notes.clone();
+            self.unmatched_notes = imp.unmatched_notes.clone();
+            self.status = format!("{}. {}", if imp.collins { imp.collins_summary() } else { "Demo".into() }, imp.table_note().unwrap_or_default());
             self.courses = imp.courses.clone();
             self.rows = imp.guests.iter().map(|g| Row::from_guest(g, &imp.courses)).collect();
         }
@@ -303,12 +327,22 @@ impl App {
         // Keep the user's courses when they edited them or when appending to an existing list.
         let keep = self.courses_edited || (!self.replace_on_import && !self.rows.is_empty());
         let base = keep.then(|| self.courses.clone());
-        match read_csv_ex(&path, base.as_deref()) {
+        // Files without a table column: replace mode uses table 1, append mode the next unused number.
+        let default_table = if self.replace_on_import || self.rows.is_empty() {
+            "1".to_string()
+        } else {
+            next_free_table(&self.rows.iter().map(|r| r.table.trim().to_string()).collect::<Vec<_>>())
+        };
+        match read_csv_opts(&path, base.as_deref(), &default_table) {
             Ok(imp) => {
                 let n = imp.guests.len();
                 if self.replace_on_import {
                     self.rows.clear();
+                    self.table_notes.clear();
+                    self.unmatched_notes.clear();
                 }
+                self.table_notes.extend(imp.table_notes.iter().cloned());
+                self.unmatched_notes.extend(imp.unmatched_notes.iter().cloned());
                 if imp.courses != self.courses {
                     self.set_courses(imp.courses.clone());
                 }
@@ -316,8 +350,20 @@ impl App {
                     self.courses_edited = false;
                 }
                 self.rows.extend(imp.guests.iter().map(|g| Row::from_guest(g, &self.courses)));
-                let mut msg = format!("Imported {n} guests from {}. ", path.display());
-                msg.push_str(&format!("{} {} courses: {}", if keep { "Using" } else { "Detected" }, self.courses.len(), self.courses.join(", ")));
+                let mut msg = if imp.collins {
+                    format!("{} from {}.", imp.collins_summary(), path.display())
+                } else {
+                    format!(
+                        "Imported {n} guests from {}. {} {} courses: {}",
+                        path.display(),
+                        if keep { "Using" } else { "Detected" },
+                        self.courses.len(),
+                        self.courses.join(", ")
+                    )
+                };
+                if let Some(t) = imp.table_note() {
+                    msg.push_str(&format!(" {t}."));
+                }
                 if !imp.warnings.is_empty() {
                     msg.push_str(&format!(" | Warning: {}", imp.warnings.join("; ")));
                     self.err(msg);
@@ -338,7 +384,7 @@ impl App {
             return;
         };
         let gs = self.valid_guests();
-        match write_csv(&path, &gs) {
+        match write_csv_ex(&path, &gs, &self.table_notes) {
             Ok(()) => self.ok(format!("Saved {} guests to {}", gs.len(), path.display())),
             Err(e) => self.err(format!("Save failed: {e}")),
         }
@@ -365,7 +411,15 @@ impl App {
         };
         let title = self.title.trim();
         let title = (!title.is_empty()).then_some(title);
-        match place_cards::plan::render_plan_courses(&gs, title, self.plan_landscape, self.allergy_marker, &self.courses, &path) {
+        match place_cards::plan::render_plan_full(
+            &gs,
+            title,
+            self.plan_landscape,
+            self.allergy_marker,
+            &self.courses,
+            &place_cards::plan::PlanExtras { table_notes: self.table_notes.clone(), unmatched_notes: self.unmatched_notes.clone() },
+            &path,
+        ) {
             Ok(info) => {
                 let mut msg = format!("Wrote seating plan ({} page(s)) to {}", info.pages, path.display());
                 if info.warnings.is_empty() {
@@ -664,7 +718,7 @@ impl eframe::App for App {
                     self.editing = Some(Editing::New);
                 }
                 if !self.new.diet.is_empty() {
-                    ui.label(self.new.diet.to_dietary().summary());
+                    ui.label(self.new.diet.summary());
                 }
                 if ui.button("Add guest").clicked() {
                     submit = true;
@@ -717,7 +771,7 @@ impl eframe::App for App {
                                 self.editing = Some(Editing::Row(i));
                                 focus = true;
                             }
-                            let summary = r.diet.to_dietary().summary();
+                            let summary = r.diet.summary();
                             let text = if r.diet.is_empty() { RichText::new(&summary).weak() } else { RichText::new(&summary).strong() };
                             ui.allocate_ui_with_layout(
                                 egui::vec2(110.0, 20.0),
@@ -728,7 +782,7 @@ impl eframe::App for App {
                                 },
                             )
                             .inner
-                            .on_hover_text(r.diet.to_dietary().describe());
+                            .on_hover_text(format!("{}{}", r.diet.to_dietary().describe(), if r.diet.notes.trim().is_empty() { String::new() } else { format!("\nNote: {}", r.diet.notes.trim()) }));
                         });
                         if r.menu.len() != self.courses.len() {
                             r.menu.resize(self.courses.len(), String::new());
@@ -929,9 +983,23 @@ impl App {
             .resizable(true)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .default_width(440.0)
-            .default_height(340.0)
-            .vscroll(true)
+            .default_height(500.0)
+            .vscroll(false)
             .show(ctx, |ui| {
+                // Buttons stay pinned at the bottom; only the options above them scroll.
+                egui::TopBottomPanel::bottom("diet_editor_buttons").show_inside(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Clear all").clicked() {
+                            *diet = DietEdit::default();
+                        }
+                        if ui.button(RichText::new("Done").strong()).clicked() {
+                            done = true;
+                        }
+                        ui.add(egui::Label::new(RichText::new(diet.summary()).weak()).truncate());
+                    });
+                });
+                egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
                 ui.label(RichText::new("Allergens").strong());
                 ui.weak("The 14 major allergens (UK / EU)");
                 egui::Grid::new("allergen_grid").num_columns(3).spacing([22.0, 6.0]).show(ui, |ui| {
@@ -962,14 +1030,9 @@ impl App {
                     }
                 });
                 ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Clear all").clicked() {
-                        *diet = DietEdit::default();
-                    }
-                    if ui.button(RichText::new("Done").strong()).clicked() {
-                        done = true;
-                    }
-                    ui.weak(diet.to_dietary().summary());
+                ui.label(RichText::new("Pre-order note").strong());
+                ui.weak("Free text for the kitchen (e.g. a swap). The guest then counts as a modified plate.");
+                ui.add(egui::TextEdit::multiline(&mut diet.notes).desired_rows(3).desired_width(f32::INFINITY).hint_text("(none)"));
                 });
             });
         if done || !open {
@@ -992,7 +1055,7 @@ impl App {
         if idx.is_empty() {
             let n = &self.new;
             let g = if n.is_blank() {
-                Guest { name: "Guest Name".into(), table: "1".into(), menu: parse_menu("Starter: Soup; Main: Beef"), dietary: vec![] }
+                Guest { name: "Guest Name".into(), table: "1".into(), menu: parse_menu("Starter: Soup; Main: Beef"), dietary: vec![], notes: String::new() }
             } else {
                 n.to_guest(&self.courses)
             };

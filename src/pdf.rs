@@ -130,7 +130,7 @@ pub fn layout_cell_ex(
     let face_mid = cy - CELL_H / 4.0;
     let mut out = Vec::new();
     let mut markers = Vec::new();
-    if allergy_marker && g.dietary.iter().any(|d| !d.trim().is_empty()) {
+    if allergy_marker && (g.dietary.iter().any(|d| !d.trim().is_empty()) || !g.notes.trim().is_empty()) {
         let (mx, my) = (cx + CELL_W / 2.0 - MARKER_INSET, cy - CELL_H / 2.0 + MARKER_INSET);
         markers.push(Marker { x_mm: mx, y_mm: my, r_mm: MARKER_R, rotated: false });
         markers.push(Marker { x_mm: 2.0 * cx - mx, y_mm: 2.0 * cy - my, r_mm: MARKER_R, rotated: true });

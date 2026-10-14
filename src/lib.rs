@@ -17,6 +17,15 @@ pub struct Guest {
     pub menu: Vec<String>,
     /// Dietary requirements / allergies (never printed on place cards).
     pub dietary: Vec<String>,
+    /// Free-text pre-order note for the kitchen (e.g. a dessert swap). Counts as a modified plate.
+    pub notes: String,
+}
+
+/// A note about a whole table (a "for the table" order, e.g. shared sides).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableNote {
+    pub table: String,
+    pub text: String,
 }
 
 /// Split a `;`-separated menu field into trimmed, non-empty choices.
@@ -37,62 +46,255 @@ pub struct CsvImport {
     pub inferred: bool,
     /// Problems worth showing (e.g. extra unlabelled menu entries that ended up in "Other").
     pub warnings: Vec<String>,
+    /// "For the table" rows (shared orders for a whole table); they are not guests.
+    pub table_notes: Vec<TableNote>,
+    /// Pre-order notes whose guest name matched nobody.
+    pub unmatched_notes: Vec<(String, String)>,
+    /// The file has no table column: every guest was put on `default_table`.
+    pub no_table: bool,
+    pub default_table: String,
+    /// A Collins-style food sheet (course columns plus a "For the table" row and/or a notes block).
+    pub collins: bool,
+    /// Pre-order notes attached to a guest.
+    pub notes_attached: usize,
 }
 
-/// Read guests from a CSV file with header `name,table,menu[,dietary]`
-/// (columns are found by header name; `menu` and `dietary`/`allergies` are optional).
-/// Menu entries are labelled with their course (see `read_csv_ex`).
+impl CsvImport {
+    /// "Imported Collins food sheet: 33 guests, courses Starter, Main, Dessert, 1 'for the table' order, 2 pre-order notes"
+    pub fn collins_summary(&self) -> String {
+        format!(
+            "Imported Collins food sheet: {} guests, courses {}, {} 'for the table' order{}, {} pre-order note{}",
+            self.guests.len(),
+            self.courses.join(", "),
+            self.table_notes.len(),
+            if self.table_notes.len() == 1 { "" } else { "s" },
+            self.notes_attached + self.unmatched_notes.len(),
+            if self.notes_attached + self.unmatched_notes.len() == 1 { "" } else { "s" },
+        )
+    }
+
+    /// "No table numbers in file: 33 guests put on table 4; edit if needed" (only when the file has no table column).
+    pub fn table_note(&self) -> Option<String> {
+        self.no_table.then(|| format!("No table numbers in file: {} guests put on table {}; edit if needed", self.guests.len(), self.default_table))
+    }
+}
+
+fn norm_name(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+fn norm_header(s: &str) -> String {
+    s.trim_start_matches('\u{feff}').trim().trim_end_matches('.').trim().to_lowercase()
+}
+
+/// The next unused table number for appended guests (largest numeric table + 1, else 1).
+pub fn next_free_table(existing: &[String]) -> String {
+    let max = existing.iter().filter_map(|t| t.trim().parse::<u32>().ok()).max().unwrap_or(0);
+    (max + 1).to_string()
+}
+
+/// Read guests from a CSV file (see `read_csv_opts`). Menu entries come out labelled with their course.
 pub fn read_csv(path: &Path) -> Result<Vec<Guest>, Box<dyn std::error::Error>> {
     Ok(read_csv_ex(path, None)?.guests)
 }
 
-/// Like `read_csv`, with course handling. Labelled menu entries ("Main: Beef") go to that course;
-/// unlabelled ones ("Soup; Beef; Tart") are assigned by position to the event's courses, which are
-/// `base` if given (unknown labels are appended) or inferred from the file. Menu entries come out
-/// labelled, in the original order.
+/// `read_csv_opts` with guests on table "1" when the file has no table column.
 pub fn read_csv_ex(path: &Path, base: Option<&[String]>) -> Result<CsvImport, Box<dyn std::error::Error>> {
-    let mut rdr = csv::ReaderBuilder::new()
-        .flexible(true)
-        .trim(csv::Trim::All)
-        .from_path(path)?;
-    let headers = rdr.headers()?.clone();
-    let col = |n: &str| headers.iter().position(|h| h.eq_ignore_ascii_case(n));
-    let name_i = col("name").ok_or("CSV header must contain a 'name' column")?;
-    let table_i = col("table").ok_or("CSV header must contain a 'table' column")?;
-    let menu_i = col("menu");
-    let diet_i = ["dietary", "allergies", "dietary/allergies"].iter().find_map(|n| col(n));
-    let mut raw: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
-    for (i, rec) in rdr.records().enumerate() {
-        let rec = rec?;
-        let line = i + 2;
-        let name = rec.get(name_i).unwrap_or("").to_string();
-        let table = rec.get(table_i).unwrap_or("").to_string();
-        if name.is_empty() && table.is_empty() {
-            continue; // blank row
-        }
-        if name.is_empty() || table.is_empty() {
-            return Err(format!("line {line}: both name and table are required").into());
-        }
-        let slots = courses::split_slots(menu_i.and_then(|m| rec.get(m)).unwrap_or(""));
-        // canonical form: allergen/preference checkboxes in fixed order, then Other entries
-        let dietary = dietary::Dietary::from_entries(&diet_i.and_then(|d| rec.get(d)).map(parse_menu).unwrap_or_default()).to_entries();
-        raw.push((name, table, slots, dietary));
+    read_csv_opts(path, base, "1")
+}
+
+/// Read guests from a CSV file, finding columns by header name (a leading BOM is ignored):
+/// name (`Name`, `Guest`, `Guest name`), table (`Table`, `Table No`, `Table number`), dietary
+/// (`dietary`, `allergies`, `dietary/allergies`, `Dietary requirements`), `notes`, and either a single
+/// `menu` column or, if there is none, **course columns**: every other column with a header, in header
+/// order, named by that header (a column no guest uses is dropped; an empty-header column of row numbers
+/// is ignored). In menu mode labelled entries ("Main: Beef") go to that course and unlabelled ones are
+/// assigned by position to the event's courses, which are `base` if given or inferred from the file.
+///
+/// Rows named "For the table" are returned as `table_notes`, not guests. After a blank row, a
+/// "CUSTOMER PRE-ORDER NOTES" row introduces `name,note` rows that are attached to the matching guest.
+/// Without a table column all guests go on `default_table`.
+pub fn read_csv_opts(path: &Path, base: Option<&[String]>, default_table: &str) -> Result<CsvImport, Box<dyn std::error::Error>> {
+    let mut bytes = std::fs::read(path)?;
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
     }
-    let all_slots: Vec<Vec<String>> = raw.iter().map(|r| r.2.clone()).collect();
-    let course_list = courses::infer_courses(&all_slots, base);
+    let mut rdr = csv::ReaderBuilder::new().has_headers(false).flexible(true).trim(csv::Trim::All).from_reader(&bytes[..]);
+    let mut recs: Vec<Vec<String>> = Vec::new();
+    for r in rdr.records() {
+        recs.push(r?.iter().map(|c| c.to_string()).collect());
+    }
+    if recs.is_empty() {
+        return Err("the CSV file is empty".into());
+    }
+    let hdr: Vec<String> = recs[0].iter().map(|h| norm_header(h)).collect();
+    let find = |names: &[&str]| hdr.iter().position(|h| names.contains(&h.as_str()));
+    let name_i = find(&["name", "guest", "guest name"]).ok_or("CSV header must contain a 'name' column")?;
+    let table_i = find(&["table", "table no", "table number"]);
+    let menu_i = find(&["menu"]);
+    let diet_i = find(&["dietary", "allergies", "dietary/allergies", "dietary requirements"]);
+    let notes_i = find(&["notes", "note"]);
+    let known = |j: usize| Some(j) == Some(name_i) || Some(j) == table_i || Some(j) == menu_i || Some(j) == diet_i || Some(j) == notes_i;
+    // An empty-header column of 1, 2, 3... is a running row number: ignored.
+    let numbered_col = (0..hdr.len()).any(|j| {
+        hdr[j].is_empty()
+            && recs[1..].iter().filter_map(|r| r.get(j)).filter(|c| !c.is_empty()).all(|c| c.parse::<u32>().is_ok())
+            && recs[1..].iter().any(|r| r.get(j).map(|c| !c.is_empty()).unwrap_or(false))
+    });
+    let course_cols: Vec<usize> = if menu_i.is_some() { Vec::new() } else { (0..hdr.len()).filter(|j| !known(*j) && !hdr[*j].is_empty()).collect() };
+    let course_mode = !course_cols.is_empty();
+
+    struct Raw {
+        name: String,
+        table: String,
+        slots: Vec<String>,
+        dishes: Vec<(usize, String)>,
+        dietary: Vec<String>,
+        notes: String,
+    }
+    let mut raw: Vec<Raw> = Vec::new();
+    let mut table_notes: Vec<TableNote> = Vec::new();
+    let mut pre_notes: Vec<(String, String)> = Vec::new();
+    let mut in_notes = false;
+    let mut notes_block = false;
+    let mut no_table = false;
+    for (i, rec) in recs.iter().enumerate().skip(1) {
+        let line = i + 1;
+        let cell = |j: Option<usize>| j.and_then(|j| rec.get(j)).map(|s| s.as_str()).unwrap_or("");
+        if rec.iter().all(|c| c.is_empty()) {
+            continue;
+        }
+        if rec.first().map(|c| c.trim().eq_ignore_ascii_case("customer pre-order notes")).unwrap_or(false) {
+            in_notes = true;
+            notes_block = true;
+            continue;
+        }
+        if in_notes {
+            let name = rec.first().map(|s| s.as_str()).unwrap_or("");
+            let note = rec.get(1).map(|s| s.as_str()).unwrap_or("");
+            if !name.is_empty() && !note.is_empty() {
+                pre_notes.push((name.to_string(), note.to_string()));
+            }
+            continue;
+        }
+        let name = cell(Some(name_i)).to_string();
+        let table = cell(table_i).to_string();
+        if norm_name(&name) == "for the table" {
+            let text = if course_mode {
+                let parts: Vec<(String, String)> = course_cols.iter().filter(|j| !cell(Some(**j)).is_empty()).map(|j| (recs[0][*j].trim().to_string(), cell(Some(*j)).to_string())).collect();
+                if parts.len() == 1 { parts[0].1.clone() } else { parts.iter().map(|(h, v)| format!("{h}: {v}")).collect::<Vec<_>>().join(" \u{b7} ") }
+            } else {
+                let n = cell(notes_i);
+                if n.is_empty() { cell(menu_i).to_string() } else { n.to_string() }
+            };
+            if !text.is_empty() {
+                table_notes.push(TableNote { table: if table_i.is_some() && !table.is_empty() { table } else { default_table.to_string() }, text });
+            }
+            continue;
+        }
+        if name.is_empty() && table.is_empty() && (table_i.is_some() || course_mode && course_cols.iter().all(|j| cell(Some(*j)).is_empty())) {
+            continue;
+        }
+        let table = if table_i.is_some() {
+            if name.is_empty() || table.is_empty() {
+                return Err(format!("line {line}: both name and table are required").into());
+            }
+            table
+        } else {
+            if name.is_empty() {
+                continue;
+            }
+            no_table = true;
+            default_table.to_string()
+        };
+        let dietary = parse_menu(cell(diet_i));
+        let notes = cell(notes_i).to_string();
+        if course_mode {
+            let dishes = course_cols.iter().filter(|j| !cell(Some(**j)).is_empty()).map(|j| (*j, cell(Some(*j)).to_string())).collect();
+            raw.push(Raw { name, table, slots: Vec::new(), dishes, dietary, notes });
+        } else {
+            raw.push(Raw { name, table, slots: courses::split_slots(cell(menu_i)), dishes: Vec::new(), dietary, notes });
+        }
+    }
+
+    // courses
+    let used: Vec<usize> = course_cols.iter().copied().filter(|j| raw.iter().any(|r| r.dishes.iter().any(|(c, _)| c == j))).collect();
+    let course_list: Vec<String> = if course_mode {
+        let mut list: Vec<String> = base.map(|b| b.to_vec()).unwrap_or_default();
+        for j in &used {
+            let h = recs[0][*j].trim().to_string();
+            if !list.iter().any(|x| courses::same_name(x, &h)) {
+                list.push(h);
+            }
+        }
+        if list.is_empty() {
+            courses::default_names(3)
+        } else {
+            list
+        }
+    } else {
+        let all_slots: Vec<Vec<String>> = raw.iter().map(|r| r.slots.clone()).collect();
+        courses::infer_courses(&all_slots, base)
+    };
     let mut guests = Vec::new();
     let mut warnings = Vec::new();
-    for (name, table, slots, dietary) in raw {
-        let a = courses::assign_row(&slots, &course_list);
-        if !a.overflow.is_empty() {
-            warnings.push(format!(
-                "{name}: more menu entries than courses; \"{}\" kept under Other",
-                a.overflow.join("\", \"")
-            ));
-        }
-        guests.push(Guest { name, table, menu: a.entries, dietary });
+    for r in raw {
+        let menu = if course_mode {
+            let mut m = Vec::new();
+            for (j, dish) in &r.dishes {
+                let h = recs[0][*j].trim();
+                let canon = course_list.iter().find(|c| courses::same_name(c, h)).cloned().unwrap_or_else(|| h.to_string());
+                m.push(format!("{canon}: {dish}"));
+            }
+            m
+        } else {
+            let a = courses::assign_row(&r.slots, &course_list);
+            if !a.overflow.is_empty() {
+                warnings.push(format!("{}: more menu entries than courses; \"{}\" kept under Other", r.name, a.overflow.join("\", \"")));
+            }
+            a.entries
+        };
+        let dietary = dietary::Dietary::from_entries(&r.dietary).to_entries();
+        guests.push(Guest { name: r.name, table: r.table, menu, dietary, notes: r.notes });
     }
-    Ok(CsvImport { guests, courses: course_list, inferred: base.is_none(), warnings })
+    // pre-order notes -> the guest with the same name (case and whitespace insensitive)
+    let mut unmatched = Vec::new();
+    let mut attached = 0;
+    for (name, note) in pre_notes {
+        let key = norm_name(&name);
+        let hits: Vec<usize> = guests.iter().enumerate().filter(|(_, g)| norm_name(&g.name) == key).map(|(i, _)| i).collect();
+        match hits.first() {
+            Some(&i) => {
+                if hits.len() > 1 {
+                    warnings.push(format!("Pre-order note for \"{name}\": {} guests share that name; attached to the first", hits.len()));
+                }
+                let g = &mut guests[i];
+                if g.notes.is_empty() {
+                    g.notes = note;
+                } else {
+                    g.notes = format!("{}\n{}", g.notes, note);
+                }
+                attached += 1;
+            }
+            None => {
+                warnings.push(format!("Pre-order note for \"{name}\" matches no guest (kept as an unmatched note)"));
+                unmatched.push((name, note));
+            }
+        }
+    }
+    let collins = course_mode && (numbered_col || !table_notes.is_empty() || notes_block);
+    Ok(CsvImport {
+        guests,
+        courses: course_list,
+        inferred: base.is_none(),
+        warnings,
+        table_notes,
+        unmatched_notes: unmatched,
+        no_table,
+        default_table: default_table.to_string(),
+        collins,
+        notes_attached: attached,
+    })
 }
 
 impl Guest {
@@ -102,12 +304,26 @@ impl Guest {
     }
 }
 
-/// Write guests to a CSV file with header `name,table,menu,dietary`.
+/// Write guests to a CSV file with header `name,table,menu,dietary,notes`.
 pub fn write_csv(path: &Path, guests: &[Guest]) -> Result<(), Box<dyn std::error::Error>> {
+    write_csv_ex(path, guests, &[])
+}
+
+/// Like `write_csv`; table notes are written as rows named "For the table" (table in `table`, text in `notes`).
+pub fn write_csv_ex(path: &Path, guests: &[Guest], table_notes: &[TableNote]) -> Result<(), Box<dyn std::error::Error>> {
     let mut w = csv::Writer::from_path(path)?;
-    w.write_record(["name", "table", "menu", "dietary"])?;
+    w.write_record(["name", "table", "menu", "dietary", "notes"])?;
     for g in guests {
-        w.write_record([g.name.as_str(), g.table.as_str(), g.menu.join("; ").as_str(), dietary::Dietary::from_entries(&g.dietary).to_entries().join("; ").as_str()])?;
+        w.write_record([
+            g.name.as_str(),
+            g.table.as_str(),
+            g.menu.join("; ").as_str(),
+            dietary::Dietary::from_entries(&g.dietary).to_entries().join("; ").as_str(),
+            g.notes.as_str(),
+        ])?;
+    }
+    for n in table_notes {
+        w.write_record(["For the table", n.table.as_str(), "", "", n.text.as_str()])?;
     }
     w.flush()?;
     Ok(())
@@ -134,7 +350,7 @@ mod tests {
         let csv = dir.join("pc_test.csv");
         let pdf_path = dir.join("pc_test.pdf");
         let guests: Vec<Guest> = (1..=8)
-            .map(|i| Guest { name: format!("Guest {i}"), table: (9 - i).to_string(), menu: parse_menu("A: x; B: y"), dietary: vec![] })
+            .map(|i| Guest { name: format!("Guest {i}"), table: (9 - i).to_string(), menu: parse_menu("A: x; B: y"), dietary: vec![], ..Default::default() })
             .collect();
         write_csv(&csv, &guests).unwrap();
         let mut back = read_csv(&csv).unwrap();
@@ -247,7 +463,7 @@ mod tests {
     }
 
     fn diet_guest(name: &str, menu: &str) -> Guest {
-        Guest { name: name.into(), table: "1".into(), menu: parse_menu(menu), dietary: parse_menu("Nut allergy") }
+        Guest { name: name.into(), table: "1".into(), menu: parse_menu(menu), dietary: parse_menu("Nut allergy"), ..Default::default() }
     }
 
     #[test]
@@ -405,6 +621,116 @@ mod tests {
         assert!(l.warnings.is_empty());
         assert!(l.pages[0].marks.contains(&plan::Mark::Totals));
         assert!(l.pages[1].marks.iter().any(|m| matches!(m, plan::Mark::Section { .. })));
+    }
+
+    fn collins() -> CsvImport {
+        read_csv_ex(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/collins_sample.csv")), None).unwrap()
+    }
+
+    #[test]
+    fn collins_sheet_course_columns_and_for_the_table() {
+        let imp = collins();
+        assert!(imp.collins);
+        // the BOM and the empty first header (running row numbers) are ignored; the unused Side column is dropped
+        assert_eq!(imp.courses, ["Starter", "Main", "Dessert"]);
+        // "For the table" is not a guest
+        assert_eq!(imp.guests.len(), 6);
+        assert!(imp.guests.iter().all(|g| !g.name.eq_ignore_ascii_case("for the table")));
+        // its text is kept verbatim, commas and all, on the table
+        assert_eq!(imp.table_notes, vec![TableNote { table: "1".into(), text: "Pork, apple & leek stuffing, Roast potatoes, Honey roast parsnips".into() }]);
+        // dishes come from the headers, commas inside a dish are kept
+        let g = &imp.guests;
+        assert_eq!(g[0].menu, ["Starter: Soup of the day", "Main: Roast beef", "Dessert: Sticky toffee pudding"]);
+        assert_eq!(g[1].menu, ["Starter: Pate & toast", "Main: Roast chicken, with gravy", "Dessert: Apple crumble"]);
+        assert_eq!(g[2].menu, ["Main: Nut roast", "Dessert: Fruit salad"]); // empty starter = no choice
+        // "Halal" maps to the Halal preference
+        assert_eq!(g[1].dietary, ["Halal"]);
+        assert!(g[1].dietary_view().prefs[3]);
+        // no table column: everyone on table 1
+        assert!(imp.no_table && g.iter().all(|x| x.table == "1"));
+    }
+
+    #[test]
+    fn collins_pre_order_notes_are_matched_by_name() {
+        let imp = collins();
+        let g = &imp.guests;
+        // multi-line note, exact name
+        assert_eq!(g[1].notes, "Swap the dessert for fruit salad.\nPlease avoid apple.");
+        // case and whitespace insensitive
+        assert_eq!(g[2].notes, "Nut roast without the cranberries");
+        assert_eq!(g[0].notes, "Beef medium rare");
+        // two guests share a name: the note goes to the first, with a warning
+        assert_eq!(g[4].notes, "Gravy on the side");
+        assert!(g[5].notes.is_empty());
+        assert!(imp.warnings.iter().any(|w| w.contains("eleanor vance") && w.contains("attached to the first")), "{:?}", imp.warnings);
+        // a name that matches nobody is kept as an unmatched note, with a warning
+        assert_eq!(imp.unmatched_notes, vec![("Nobody Here".to_string(), "This name is not on the guest list".to_string())]);
+        assert!(imp.warnings.iter().any(|w| w.contains("Nobody Here") && w.contains("matches no guest")));
+        assert_eq!(imp.notes_attached, 4);
+        // detection messages
+        assert_eq!(
+            imp.collins_summary(),
+            "Imported Collins food sheet: 6 guests, courses Starter, Main, Dessert, 1 'for the table' order, 5 pre-order notes"
+        );
+        assert_eq!(imp.table_note().as_deref(), Some("No table numbers in file: 6 guests put on table 1; edit if needed"));
+    }
+
+    #[test]
+    fn collins_default_table_and_next_free_table() {
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/collins_sample.csv"));
+        let imp = read_csv_opts(path, None, "4").unwrap();
+        assert!(imp.guests.iter().all(|g| g.table == "4"));
+        assert_eq!(imp.table_notes[0].table, "4");
+        assert!(imp.table_note().unwrap().contains("put on table 4"));
+        // the library function the GUI uses in append mode
+        assert_eq!(next_free_table(&[]), "1");
+        assert_eq!(next_free_table(&["1".into(), "2".into(), "3".into()]), "4");
+        assert_eq!(next_free_table(&["A".into(), " 7 ".into()]), "8");
+        assert_eq!(next_free_table(&["Head".into()]), "1");
+    }
+
+    #[test]
+    fn header_aliases_bom_and_row_number_column() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("pc_alias2.csv");
+        // BOM + empty numbered first column + Guest / Table No. / Dietary requirements aliases + single menu column
+        std::fs::write(&p, "\u{feff},Guest,Table No.,menu,Dietary requirements,Notes\n1,Ann Lee,5,Soup; Beef,Halal; Milk,\"Well done\"\n").unwrap();
+        let imp = read_csv_ex(&p, None).unwrap();
+        assert!(!imp.collins && !imp.no_table);
+        assert_eq!((imp.guests[0].name.as_str(), imp.guests[0].table.as_str()), ("Ann Lee", "5"));
+        assert_eq!(imp.guests[0].menu, ["Main: Soup", "Dessert: Beef"]); // menu column: positional inference as before (2 entries -> 2 courses)
+        assert_eq!(imp.guests[0].dietary, ["Milk", "Halal"]);
+        assert_eq!(imp.guests[0].notes, "Well done");
+    }
+
+    #[test]
+    fn collins_round_trip_keeps_notes_and_table_notes() {
+        let imp = collins();
+        let out = std::env::temp_dir().join("pc_collins_rt.csv");
+        write_csv_ex(&out, &imp.guests, &imp.table_notes).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.starts_with("name,table,menu,dietary,notes"));
+        assert!(text.contains("For the table"), "the shared order is written as a row named For the table");
+        let back = read_csv_opts(&out, None, "9").unwrap();
+        assert!(!back.collins && !back.no_table);
+        assert_eq!(back.guests.len(), imp.guests.len());
+        for (a, b) in imp.guests.iter().zip(&back.guests) {
+            assert_eq!((&a.name, &a.table, &a.menu, &a.dietary, &a.notes), (&b.name, &b.table, &b.menu, &b.dietary, &b.notes));
+        }
+        assert_eq!(back.table_notes, imp.table_notes);
+        // (unmatched notes are not part of the guest list and are not written)
+        assert!(back.unmatched_notes.is_empty());
+    }
+
+    #[test]
+    fn a_pre_order_note_alone_marks_the_card() {
+        let mut m = fonts::Measurer::new();
+        let f = fonts::Fonts::default();
+        let (cx, cy) = pdf::cell_center(0);
+        let plain = Guest { name: "A".into(), table: "1".into(), ..Default::default() };
+        let noted = Guest { notes: "no onion".into(), ..plain.clone() };
+        assert!(pdf::layout_cell_ex(&plain, None, &f, &mut m, cx, cy, true).markers.is_empty());
+        assert_eq!(pdf::layout_cell_ex(&noted, None, &f, &mut m, cx, cy, true).markers.len(), 2);
     }
 
     #[test]

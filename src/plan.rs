@@ -7,7 +7,7 @@
 
 use crate::dietary::{classify, Dietary, Item};
 use crate::fonts::Builtin;
-use crate::{metrics, table_sort_key, Guest};
+use crate::{metrics, table_sort_key, Guest, TableNote};
 use printpdf::*;
 use std::collections::HashMap;
 use std::fs::File;
@@ -26,6 +26,30 @@ pub struct PGuest {
     pub dietary: Vec<String>,
     /// Typed view of `dietary` (allergens / preferences / other).
     pub diet: Dietary,
+    /// Free-text pre-order note (line breaks shown as " / "); a guest with a note needs a modified plate.
+    pub note: String,
+}
+
+impl PGuest {
+    /// True for a standard plate: no dietary entries and no pre-order note.
+    pub fn plain(&self) -> bool {
+        self.dietary.is_empty() && self.note.is_empty()
+    }
+
+    /// "Allergens: ... · Diet: ... · Other: ... · Note: ..." (empty parts omitted).
+    pub fn requirements(&self) -> String {
+        let d = self.diet.describe();
+        match (d.is_empty(), self.note.is_empty()) {
+            (_, true) => d,
+            (true, false) => format!("Note: {}", self.note),
+            (false, false) => format!("{d} \u{b7} Note: {}", self.note),
+        }
+    }
+
+    /// Grouping key for identical modified plates (requirement sets and the exact note).
+    pub fn key(&self) -> String {
+        format!("{}|{}", self.diet.key(), self.note.to_lowercase())
+    }
 }
 
 pub struct PTable {
@@ -169,7 +193,7 @@ pub fn analyze_ordered(guests: &[Guest], order: &[String]) -> Analysis {
                 diet.push(e.clone());
             }
         }
-        pg.push(PGuest { name: g.name.clone(), table: g.table.clone(), cells, has_menu, dietary, diet: d });
+        pg.push(PGuest { name: g.name.clone(), table: g.table.clone(), cells, has_menu, dietary, diet: d, note: g.notes.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" / ") });
     }
     // Allergens first (fixed order), then preferences, then Other (first seen).
     diet.sort_by_key(|e| match classify(e) {
@@ -220,8 +244,8 @@ impl Analysis {
             .copied()
             .filter(|&gi| match which {
                 Which::All => true,
-                Which::Standard => self.guests[gi].dietary.is_empty(),
-                Which::Dietary => !self.guests[gi].dietary.is_empty(),
+                Which::Standard => self.guests[gi].plain(),
+                Which::Dietary => !self.guests[gi].plain(),
             })
             .collect();
         self.counts(Some(&keep))
@@ -232,7 +256,7 @@ impl Analysis {
     /// requirements but no menu choices come last under `col == None`.
     pub fn diet_portions(&self) -> Vec<DietPortion> {
         let key = |g: &PGuest| {
-            g.diet.key()
+            g.key()
         };
         let mut out: Vec<DietPortion> = Vec::new();
         let add = |col: Option<usize>, dish: &str, g: &PGuest, out: &mut Vec<DietPortion>| {
@@ -241,17 +265,17 @@ impl Analysis {
             if let Some(p) = out.iter_mut().find(|p| p.col == col && p.dish == dish && p.key == k) {
                 p.guests.push(who);
             } else {
-                out.push(DietPortion { col, dish: dish.to_string(), combo: g.diet.describe(), key: k, guests: vec![who] });
+                out.push(DietPortion { col, dish: dish.to_string(), combo: g.requirements(), key: k, guests: vec![who] });
             }
         };
         for (col, dishes) in self.dishes.iter().enumerate() {
             for dish in dishes {
-                for g in self.guests.iter().filter(|g| !g.dietary.is_empty() && g.cells[col].contains(dish)) {
+                for g in self.guests.iter().filter(|g| !g.plain() && g.cells[col].contains(dish)) {
                     add(Some(col), dish, g, &mut out);
                 }
             }
         }
-        for g in self.guests.iter().filter(|g| !g.dietary.is_empty() && !g.has_menu) {
+        for g in self.guests.iter().filter(|g| !g.plain() && !g.has_menu) {
             add(None, NO_MENU, g, &mut out);
         }
         out
@@ -308,7 +332,7 @@ impl Analysis {
             })
             .collect();
         let any_menu = subset.iter().any(|&gi| self.guests[gi].has_menu);
-        let any_std = subset.iter().any(|&gi| self.guests[gi].dietary.is_empty());
+        let any_std = subset.iter().any(|&gi| self.guests[gi].plain());
         let courses = if !parts.is_empty() {
             parts.join(" \u{b7} ")
         } else if any_menu && !any_std {
@@ -319,11 +343,11 @@ impl Analysis {
         let who: Vec<String> = subset
             .iter()
             .map(|&gi| &self.guests[gi])
-            .filter(|g| !g.dietary.is_empty())
+            .filter(|g| !g.plain())
             .map(|g| {
                 let dishes: Vec<&str> = g.cells.iter().flatten().map(|d| d.as_str()).collect();
                 let dishes = if dishes.is_empty() { "no menu choices recorded".to_string() } else { dishes.join(", ") };
-                format!("{} \u{2014} {} \u{2014} {}", g.name, dishes, g.diet.describe())
+                format!("{} \u{2014} {} \u{2014} {}", g.name, dishes, g.requirements())
             })
             .collect();
         (courses, (!who.is_empty()).then(|| format!("Dietary: {}", who.join("; "))))
@@ -360,6 +384,19 @@ pub enum Mark {
     ColHeader,
     GuestRows { table: String, n: usize },
     Summary { table: String },
+    /// The "For the table" line under a table's guests.
+    TableNote { table: String },
+    /// Kitchen sheet: the "For the table (shared)" section.
+    SharedOrders,
+    /// Kitchen sheet: pre-order notes that matched no guest.
+    UnmatchedNotes,
+}
+
+/// Extra plan content that is not part of a guest: shared orders per table and unmatched notes.
+#[derive(Clone, Debug, Default)]
+pub struct PlanExtras {
+    pub table_notes: Vec<TableNote>,
+    pub unmatched_notes: Vec<(String, String)>,
 }
 
 #[derive(Default, Debug)]
@@ -398,7 +435,7 @@ const PT: f32 = 0.352_778;
 pub const BODY_MAX_PT: f32 = 9.0;
 pub const BODY_MIN_PT: f32 = 6.0;
 const GUTTER: f32 = 4.0;
-const MAX_LINES: usize = 4;
+const MAX_LINES: usize = 12;
 const DIET_LINES: usize = 40;
 
 thread_local! {
@@ -886,8 +923,21 @@ pub fn layout_plan_courses(
     marker_key: bool,
     courses: &[String],
 ) -> PlanLayout {
+    layout_plan_full(guests, title, date, force_landscape, marker_key, courses, &PlanExtras::default())
+}
+
+/// Like `layout_plan_courses`, with shared "for the table" orders and unmatched pre-order notes.
+pub fn layout_plan_full(
+    guests: &[Guest],
+    title: Option<&str>,
+    date: &str,
+    force_landscape: bool,
+    marker_key: bool,
+    courses: &[String],
+    extras: &PlanExtras,
+) -> PlanLayout {
     let a = analyze_ordered(guests, courses);
-    let marker_key = marker_key && a.guests.iter().any(|g| !g.dietary.is_empty());
+    let marker_key = marker_key && a.guests.iter().any(|g| !g.plain());
     let n_tables = a.tables.len();
     let wanted = n_tables > 0 && a.dishes.iter().any(|d| !d.is_empty());
     let orients: Vec<bool> = if force_landscape { vec![true] } else { vec![false, true] };
@@ -900,14 +950,14 @@ pub fn layout_plan_courses(
             return None;
         }
         let matrix = wanted && fits;
-        let pages = kitchen_sheet(&a, landscape, ncols, matrix, wanted && !fits, marker_key);
+        let pages = kitchen_sheet(&a, landscape, ncols, matrix, wanted && !fits, marker_key, extras);
         Some(Sheet { pages, pt: body(), landscape, matrix })
     });
     let tables = best_sheet(&orients, 4, 62.0, &|landscape, ncols, _s| {
-        let mut pages = tables_sheet(&a, landscape, ncols, false)?;
+        let mut pages = tables_sheet(&a, landscape, ncols, false, extras)?;
         // Only at the 6 pt floor, and only when it saves a page: let a table continue in the next column.
         if pages.len() > 1 && body() <= BODY_MIN_PT + 0.01 {
-            if let Some(alt) = tables_sheet(&a, landscape, ncols, true) {
+            if let Some(alt) = tables_sheet(&a, landscape, ncols, true, extras) {
                 if alt.len() < pages.len() {
                     pages = alt;
                 }
@@ -1007,7 +1057,7 @@ fn matrix_block(a: &Analysis, landscape: bool, cw: f32) -> (Vec<Col>, Row, Vec<R
 const MATRIX_TITLE: &str = "Dishes by table (all portions, incl. dietary)";
 
 /// Kitchen sheet: dietary list, kitchen totals, dietary portions (in `ncols` columns) and the matrix below.
-fn kitchen_sheet(a: &Analysis, landscape: bool, ncols: usize, matrix: bool, matrix_omitted: bool, marker_key: bool) -> Vec<PlanPage> {
+fn kitchen_sheet(a: &Analysis, landscape: bool, ncols: usize, matrix: bool, matrix_omitted: bool, marker_key: bool, extras: &PlanExtras) -> Vec<PlanPage> {
     let n_tables = a.tables.len();
     let (w, h) = page_size(landscape);
     let mut f = Flow::new(w, h, marker_key, "Kitchen");
@@ -1025,7 +1075,7 @@ fn kitchen_sheet(a: &Analysis, landscape: bool, ncols: usize, matrix: bool, matr
         .tables
         .iter()
         .flat_map(|t| t.guests.iter().map(move |&gi| (t.name.as_str(), gi)))
-        .filter(|(_, gi)| !a.guests[*gi].dietary.is_empty())
+        .filter(|(_, gi)| !a.guests[*gi].plain())
         .map(|(t, gi)| (t, &a.guests[gi]))
         .collect();
 
@@ -1056,7 +1106,7 @@ fn kitchen_sheet(a: &Analysis, landscape: bool, ncols: usize, matrix: bool, matr
             .map(|(i, (tname, g))| {
                 make_row_ex(
                     &dcols,
-                    &[tname.to_string(), g.name.clone(), format!("! {}", g.diet.describe())],
+                    &[tname.to_string(), g.name.clone(), format!("! {}", g.requirements())],
                     body(),
                     vec![true, false, true],
                     true,
@@ -1075,7 +1125,7 @@ fn kitchen_sheet(a: &Analysis, landscape: bool, ncols: usize, matrix: bool, matr
     f.ensure(heading_h(section()) + 2.0 * line_h(body()) + heading_h(sub()) + 3.0 * (line_h(body()) + 2.0 * pad()));
     heading(&mut f, "Kitchen totals", section());
     let n = a.guests.len();
-    let n_diet = a.guests.iter().filter(|g| !g.dietary.is_empty()).count();
+    let n_diet = a.guests.iter().filter(|g| !g.plain()).count();
     let line = format!(
         "Total guests: {n}  \u{b7}  Tables: {n_tables}  \u{b7}  Guests with no menu choices: {}  \u{b7}  Guests with dietary requirements: {n_diet}",
         a.no_menu
@@ -1137,9 +1187,9 @@ fn kitchen_sheet(a: &Analysis, landscape: bool, ncols: usize, matrix: bool, matr
 
     f.y += gap();
     f.mark(Mark::DietaryPortions);
-    f.ensure(heading_h(sub()) + 3.0 * (line_h(body()) + 2.0 * pad()));
-    heading(&mut f, "Dietary / allergy portions", sub());
     if portions.is_empty() {
+        f.ensure(heading_h(sub()) + 2.0 * (line_h(body()) + 2.0 * pad()));
+        heading(&mut f, "Dietary / allergy portions", sub());
         let base = f.y + body() * PT;
         f.text("No dietary portions.", MARGIN, base, body(), true, 0.0);
         f.y = base + 2.0 * scale();
@@ -1176,7 +1226,41 @@ fn kitchen_sheet(a: &Analysis, landscape: bool, ncols: usize, matrix: bool, matr
                 ),
             ));
         }
+        // keep the heading with the column header and the first rows
+        f.ensure(heading_h(sub()) + ph.h + prows.iter().take(3).map(|r| r.1.h).sum::<f32>());
+        heading(&mut f, "Dietary / allergy portions", sub());
         flow_rows_multi(&mut f, &[&pcols, &full], 0, &ph, &prows);
+    }
+
+    // ---- For the table (shared): each table's shared order, verbatim (not counted in the dish totals)
+    if !extras.table_notes.is_empty() {
+        f.y += gap();
+        f.mark(Mark::SharedOrders);
+        f.ensure(heading_h(sub()) + 3.0 * (line_h(body()) + 2.0 * pad()));
+        heading(&mut f, "For the table (shared)", sub());
+        let scols = vec![Col { x: MARGIN, w: cw * 0.14 }, Col { x: MARGIN + cw * 0.14, w: cw * 0.86 }];
+        let sh = make_row(&scols, &["Table".into(), "Shared items (verbatim)".into()], head(), true, Some(0.82), vec![false; 2], 1);
+        let srows: Vec<Row> = extras
+            .table_notes
+            .iter()
+            .map(|n| make_row_ex(&scols, &[n.table.clone(), n.text.clone()], body(), vec![true, true], true, Some(0.86), vec![false; 2], DIET_LINES))
+            .collect();
+        flow_rows(&mut f, &scols, &sh, &srows);
+    }
+    // ---- Pre-order notes that matched no guest
+    if !extras.unmatched_notes.is_empty() {
+        f.y += gap();
+        f.mark(Mark::UnmatchedNotes);
+        f.ensure(heading_h(sub()) + 3.0 * (line_h(body()) + 2.0 * pad()));
+        heading(&mut f, "Unmatched pre-order notes (no guest with that name)", sub());
+        let ucols = vec![Col { x: MARGIN, w: cw * 0.30 }, Col { x: MARGIN + cw * 0.30, w: cw * 0.70 }];
+        let uh = make_row(&ucols, &["Name in the notes".into(), "Note".into()], head(), true, Some(0.82), vec![false; 2], 1);
+        let urows: Vec<Row> = extras
+            .unmatched_notes
+            .iter()
+            .map(|(n, t)| make_row_ex(&ucols, &[n.clone(), format!("Note: {}", t.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" / "))], body(), vec![true, true], true, Some(0.86), vec![false; 2], DIET_LINES))
+            .collect();
+        flow_rows(&mut f, &ucols, &uh, &urows);
     }
     f.end_zone();
 
@@ -1207,7 +1291,7 @@ fn kitchen_sheet(a: &Analysis, landscape: bool, ncols: usize, matrix: bool, matr
 /// Tables sheet: every table's guests (course dishes and Dietary / allergies next to the name) and the
 /// runner summary of standard portions, in `ncols` newspaper columns. A table is not split across columns
 /// unless it is taller than a column or `split_ok` (used at the floor size to save a page).
-fn tables_sheet(a: &Analysis, landscape: bool, ncols: usize, split_ok: bool) -> Option<Vec<PlanPage>> {
+fn tables_sheet(a: &Analysis, landscape: bool, ncols: usize, split_ok: bool, extras: &PlanExtras) -> Option<Vec<PlanPage>> {
     let (w, h) = page_size(landscape);
     let mut f = Flow::new(w, h, false, "Tables");
     f.begin_zone(ncols, None);
@@ -1233,8 +1317,8 @@ fn tables_sheet(a: &Analysis, landscape: bool, ncols: usize, split_ok: bool) -> 
         for (i, cell) in g.cells.iter().enumerate() {
             note(1 + i, &cell.join(", "), false, body());
         }
-        if !g.dietary.is_empty() {
-            note(nc - 1, &format!("! {}", g.diet.describe()), true, body());
+        if !g.plain() {
+            note(nc - 1, &format!("! {}", g.requirements()), true, body());
         }
     }
     for (i, c) in a.columns.iter().enumerate() {
@@ -1286,8 +1370,8 @@ fn tables_sheet(a: &Analysis, landscape: bool, ncols: usize, split_ok: bool) -> 
                 for cell in &g.cells {
                     txt.push(if cell.is_empty() { "\u{2014}".into() } else { cell.join(", ") });
                 }
-                let flagged = !g.dietary.is_empty();
-                txt.push(if flagged { format!("! {}", g.diet.describe()) } else { "\u{2014}".into() });
+                let flagged = !g.plain();
+                txt.push(if flagged { format!("! {}", g.requirements()) } else { "\u{2014}".into() });
                 let mut bolds = vec![false; cols.len()];
                 if flagged {
                     bolds[0] = true;
@@ -1300,8 +1384,10 @@ fn tables_sheet(a: &Analysis, landscape: bool, ncols: usize, split_ok: bool) -> 
             .collect();
         // runner summary: standard portions only (the dietary text is already in each guest's row)
         let (c_text, _) = a.summary_parts(&t.guests);
-        let c_lines = wrap(&c_text, body(), true, cw - 2.0 * hpad(), 6);
-        let sum_h = band_h(&c_lines) + 0.6 * scale();
+        let c_lines = wrap(&c_text, body(), true, cw - 2.0 * hpad(), 60);
+        let table_texts: Vec<&str> = extras.table_notes.iter().filter(|n| n.table.trim().eq_ignore_ascii_case(t.name.trim())).map(|n| n.text.as_str()).collect();
+        let note_lines = (!table_texts.is_empty()).then(|| wrap(&format!("For the table: {}", table_texts.join(" | ")), body(), true, cw - 2.0 * hpad(), 60));
+        let sum_h = band_h(&c_lines) + 0.6 * scale() + note_lines.as_ref().map(|l| band_h(l) + 0.6 * scale()).unwrap_or(0.0);
         let label = format!("Table {} \u{b7} {} guest{}", t.name, t.guests.len(), if t.guests.len() == 1 { "" } else { "s" });
         let mut cont = false;
         let total_h = group_row_h() + hr.h + rows.iter().map(|r| r.h).sum::<f32>() + sum_h;
@@ -1342,6 +1428,14 @@ fn tables_sheet(a: &Analysis, landscape: bool, ncols: usize, split_ok: bool) -> 
         f.mark(Mark::Summary { table: t.name.clone() });
         f.y += 0.6 * scale();
         draw_band(&mut f, &c_lines, 0.9);
+        if let Some(nl) = &note_lines {
+            // the shared order of the whole table: highlighted like a dietary line, not a guest row
+            f.mark(Mark::TableNote { table: t.name.clone() });
+            f.y += 0.6 * scale();
+            let (y0, h2) = (f.y, band_h(nl));
+            f.rect(MARGIN - 2.6, y0, 1.8, h2, 0.0);
+            draw_band(&mut f, nl, 0.78);
+        }
         f.y += 1.4 * scale();
     }
     f.end_zone();
@@ -1408,7 +1502,20 @@ pub fn render_plan_courses(
     courses: &[String],
     out: &Path,
 ) -> Result<PlanInfo, Box<dyn std::error::Error>> {
-    let lay = layout_plan_courses(guests, title, &today(), force_landscape, marker_key, courses);
+    render_plan_full(guests, title, force_landscape, marker_key, courses, &PlanExtras::default(), out)
+}
+
+/// Write the seating plan PDF with shared "for the table" orders and unmatched notes.
+pub fn render_plan_full(
+    guests: &[Guest],
+    title: Option<&str>,
+    force_landscape: bool,
+    marker_key: bool,
+    courses: &[String],
+    extras: &PlanExtras,
+    out: &Path,
+) -> Result<PlanInfo, Box<dyn std::error::Error>> {
+    let lay = layout_plan_full(guests, title, &today(), force_landscape, marker_key, courses, extras);
     let (doc, p0, l0) = PdfDocument::new("Seating plan", Mm(lay.pages[0].w), Mm(lay.pages[0].h), "plan");
     let reg = doc.add_builtin_font(BuiltinFont::Helvetica)?;
     let bold = doc.add_builtin_font(BuiltinFont::HelveticaBold)?;
@@ -1471,7 +1578,7 @@ mod tests {
     use crate::parse_menu;
 
     fn g(name: &str, table: &str, menu: &str) -> Guest {
-        Guest { name: name.into(), table: table.into(), menu: parse_menu(menu), dietary: vec![] }
+        Guest { name: name.into(), table: table.into(), menu: parse_menu(menu), dietary: vec![], notes: String::new() }
     }
 
     #[test]
@@ -1931,6 +2038,62 @@ mod tests {
         assert!(t.iter().any(|x| x.contains("(cont.)")), "continued sections are labelled");
         check_layout_sane(&l);
         check_pagination(&l, 10, 40);
+    }
+
+    fn noted(name: &str, table: &str, menu: &str, note: &str) -> Guest {
+        Guest { notes: note.into(), ..g(name, table, menu) }
+    }
+
+    #[test]
+    fn a_pre_order_note_makes_a_modified_plate() {
+        let guests = vec![g("Ann", "1", "Main: Beef"), noted("Ben", "1", "Main: Beef", "Swap dessert\nfor fruit"), noted("Cy", "1", "", "Well done")];
+        let a = analyze(&guests);
+        // counted as dietary (modified), not standard, even with no dietary entries
+        assert!(a.guests[0].plain() && !a.guests[1].plain() && !a.guests[2].plain());
+        assert_eq!(a.guests[1].note, "Swap dessert / for fruit");
+        let std = a.counts_which(None, Which::Standard);
+        let dt = a.counts_which(None, Which::Dietary);
+        let main = a.columns.iter().position(|c| c == "Main").unwrap();
+        assert_eq!((std[main][0].1, dt[main][0].1), (1, 1));
+        let p = a.diet_portions();
+        assert!(p.iter().any(|x| x.combo == "Note: Swap dessert / for fruit" && x.guests[0].0 == "Ben"));
+        assert!(p.iter().any(|x| x.dish == NO_MENU && x.combo == "Note: Well done"), "a noted guest with no menu is listed");
+        // the note shows (in full) on both sheets, flagged like a dietary entry
+        let l = layout_plan(&guests, None, "d", false);
+        let t = all_text(&l).join(" ");
+        assert!(t.contains("! Note: Swap dessert / for fruit"), "{t}");
+        assert!(t.contains("Guests with dietary requirements: 2"));
+        // dietary + note combine
+        let both = analyze(&[Guest { notes: "no onion".into(), ..gd("Di", "1", "Main: x", "Vegan") }]);
+        assert_eq!(both.guests[0].requirements(), "Diet: Vegan \u{b7} Note: no onion");
+        check_layout_sane(&l);
+    }
+
+    #[test]
+    fn for_the_table_orders_and_unmatched_notes_in_the_plan() {
+        let guests = vec![g("Ann", "1", "Main: Beef"), g("Ben", "2", "Main: Beef")];
+        let extras = PlanExtras {
+            table_notes: vec![TableNote { table: "2".into(), text: "Pork, apple & leek stuffing, Roast potatoes".into() }],
+            unmatched_notes: vec![("Zed Nobody".into(), "No gluten".into())],
+        };
+        let l = layout_plan_full(&guests, None, "d", false, true, &[], &extras);
+        let kitchen: Vec<String> = l.pages.iter().filter(|p| p.sheet == "Kitchen").flat_map(|p| p.items.iter()).filter_map(|i| if let PlanItem::Text { text, .. } = i { Some(text.clone()) } else { None }).collect();
+        let tables: Vec<String> = l.pages.iter().filter(|p| p.sheet == "Tables").flat_map(|p| p.items.iter()).filter_map(|i| if let PlanItem::Text { text, .. } = i { Some(text.clone()) } else { None }).collect();
+        // Kitchen sheet: a shared section, text verbatim with its commas
+        assert!(kitchen.iter().any(|t| t == "For the table (shared)"));
+        assert!(kitchen.join(" ").contains("Pork, apple & leek stuffing, Roast potatoes"));
+        assert!(kitchen.iter().any(|t| t.starts_with("Unmatched pre-order notes")) && kitchen.join(" ").contains("Zed Nobody"));
+        // Tables sheet: a highlighted line under table 2, not a guest row
+        assert!(tables.join(" ").contains("For the table: Pork, apple & leek stuffing, Roast potatoes"));
+        let marks: Vec<&Mark> = l.pages.iter().flat_map(|p| &p.marks).collect();
+        assert!(marks.contains(&&Mark::TableNote { table: "2".into() }));
+        assert!(!marks.iter().any(|m| matches!(m, Mark::TableNote { table } if table == "1")));
+        // shared orders are not dish totals: the totals are unchanged
+        let plain = layout_plan(&guests, None, "d", false);
+        assert_eq!(all_text(&plain).iter().filter(|t| t.contains("Pork")).count(), 0);
+        let a = analyze(&guests);
+        assert_eq!(a.counts(None)[0][0].1, 2);
+        check_layout_sane(&l);
     }
 
     #[test]

@@ -114,6 +114,38 @@ so you can re-tick them properly.** It is shown in the seating plan only (as
 "Allergens: ... · Diet: ... · Other: ..."), never on place cards, apart from the
 optional marker dot below.
 
+## Importing from Collins
+
+Export the venue system's **food sheet** as CSV (UTF-8, with or without the BOM) and use **Import CSV...**
+(or `place-cards food-sheet.csv`). The file is recognised by its columns: the first column has no header
+and holds a running row number (ignored), `Name`, then **one column per course, named by its header**
+(Starter, Main, Side, Dessert, ... in header order, no positional guessing needed), then
+`Dietary requirements`. Any CSV may use these header names: Name/Guest/Guest name, Table/Table No/Table
+number, Dietary/Allergies/Dietary requirements, Notes, and either a single `menu` column or course columns.
+A course column that no guest uses (for example Side, which only the "For the table" row fills) is dropped.
+
+- **Table numbers:** the sheet has none, so every guest goes on one table: table 1 (or `--table N` on the
+  CLI). In the GUI, replace mode uses table 1 and append mode the next unused number, so importing one
+  sheet per booking gives tables 1, 2, 3. The status line says e.g. "No table numbers in file: 33 guests put
+  on table 4; edit if needed".
+- **"For the table" row:** not a guest (no place card, not in the guest count, not in the dish totals).
+  Its text (a comma-separated list of shared sides; the items may contain commas) is kept verbatim as a
+  note on the table: shown on the Kitchen sheet under "For the table (shared)" and as a highlighted
+  "For the table: ..." line under that table on the Tables sheet.
+- **Pre-order notes:** the `CUSTOMER PRE-ORDER NOTES` block (`name, note` rows, notes may span several
+  lines) is attached to the guest with the same name (case and spacing ignored). If several guests share
+  the name the first gets it (warning); a name that matches nobody is listed on the Kitchen sheet under
+  "Unmatched pre-order notes" (warning). A guest with a note needs a **modified plate**: counted as dietary
+  (not standard), shown as "Note: ..." (never truncated) in the Kitchen sheet's dietary list and portions
+  and flagged "!" in the Tables sheet, and gets the allergy-marker dot on the card. Notes are free text and
+  are not turned into allergen ticks; edit them in the guest's dietary popup. They are saved in a `notes`
+  column.
+- **Dietary requirements** text goes through the same mapping as the `dietary` column ("Halal" ticks Halal;
+  anything ambiguous stays in Other).
+
+Save CSV writes the `notes` column and writes each "for the table" order back as a row named `For the
+table` (table number in `table`, the text in `notes`), so it round-trips. Unmatched notes are not saved.
+
 ## Seating plan & menu (back of house)
 
 A separate A4 PDF for food running, from the same guest list.

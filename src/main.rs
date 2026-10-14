@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use std::io::{self, BufRead, Write};
 use place_cards::fonts::{FontSpec, Fonts};
-use place_cards::{courses, Guest, pdf, read_csv_ex, sort_by_table};
+use place_cards::{courses, Guest, pdf, read_csv_opts, sort_by_table};
 use std::path::PathBuf;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -50,6 +50,9 @@ struct Cli {
     /// (labels, else the longest menu row), or 3 courses.
     #[arg(long, value_name = "N|NAMES")]
     courses: Option<String>,
+    /// Table number for guests when the CSV has no table column (e.g. a Collins food sheet). Default 1.
+    #[arg(long, value_name = "N", default_value = "1")]
+    table: String,
     /// Sort guests before layout.
     #[arg(long, value_enum)]
     sort: Option<SortBy>,
@@ -87,7 +90,7 @@ fn interactive(course_list: &[String]) -> io::Result<Vec<Guest>> {
             eprintln!("warning: more entries than courses; \"{}\" kept under Other", a.overflow.join("\", \""));
         }
         let menu = a.entries;
-        guests.push(Guest { name, table, menu, dietary: Vec::new() });
+        guests.push(Guest { name, table, menu, dietary: Vec::new(), notes: String::new() });
     }
     Ok(guests)
 }
@@ -102,20 +105,26 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let base: Option<Vec<String>> = cli.courses.as_deref().map(courses::parse_courses_arg).transpose()?;
-    let (mut guests, course_list) = match &cli.csv {
+    let (mut guests, course_list, extras) = match &cli.csv {
         Some(p) => {
-            let imp = read_csv_ex(p, base.as_deref())?;
+            let imp = read_csv_opts(p, base.as_deref(), cli.table.trim())?;
             for w in &imp.warnings {
                 eprintln!("warning: {w}");
             }
-            if imp.inferred {
+            if imp.collins {
+                eprintln!("{}", imp.collins_summary());
+            } else if imp.inferred {
                 eprintln!("Detected {} courses: {}", imp.courses.len(), imp.courses.join(", "));
             }
-            (imp.guests, imp.courses)
+            if let Some(n) = imp.table_note() {
+                eprintln!("{n}");
+            }
+            let extras = place_cards::plan::PlanExtras { table_notes: imp.table_notes, unmatched_notes: imp.unmatched_notes };
+            (imp.guests, imp.courses, extras)
         }
         None => {
             let c = base.clone().unwrap_or_else(|| courses::default_names(3));
-            (interactive(&c)?, c)
+            (interactive(&c)?, c, place_cards::plan::PlanExtras::default())
         }
     };
     if guests.is_empty() {
@@ -128,7 +137,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         sort_by_table(&mut guests);
     }
     if let Some(plan) = &cli.plan {
-        let info = place_cards::plan::render_plan_courses(&plan_guests, cli.title.as_deref(), cli.plan_landscape, !cli.no_allergy_marker, &course_list, plan)?;
+        let info = place_cards::plan::render_plan_full(&plan_guests, cli.title.as_deref(), cli.plan_landscape, !cli.no_allergy_marker, &course_list, &extras, plan)?;
         println!(
             "Wrote seating plan ({} page(s), Kitchen sheet {} pt / Tables sheet {} pt, {}) to {}",
             info.pages,
