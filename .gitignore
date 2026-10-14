@@ -1,0 +1,5 @@
+/target
+dist/
+/cards.pdf
+/seating-plan.pdf
+.DS_Store
