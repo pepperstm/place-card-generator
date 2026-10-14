@@ -137,10 +137,23 @@ with a row per guest in list order, a "-" for missing courses, a "Dietary / alle
 summary such as `Main: Beef x2, Salmon x1 · Dessert: Tart x3`. Every page has the
 event title, "Seating plan & menu", the date and "Page X of Y". A table is kept
 on one page when it fits, otherwise it continues as "Table N (cont.)" with the
-column headers repeated. Text is always Helvetica (body 11 pt, headers 14 pt+);
-long names and dishes wrap up to 3 lines and then end in an ellipsis. Portrait is
-used unless there are more than 3 course columns, more than 8 tables, or
-landscape is forced. Requirements are written as "Allergens: ... · Diet: ... · Other: ..." (empty parts omitted); the page-1 totals list per-allergen counts first, then preferences, then Other. Guests with a dietary entry are shown in bold with a heavier grey band, a "!" marker and a black bar in the margin (clear in black-and-white), and each table gets an extra "! Dietary: ..." band under its summary. There is no seat numbering (no seat data).
+column headers repeated. Text is always Helvetica and nothing is larger than 12 pt
+(page title 12 pt bold, section headings 11, table sub-headings 10, body and column
+headers 9, footer and key 8). Long names and dishes wrap up to 3 lines (dietary text up to 6) and then
+end in an ellipsis. Requirements are written as "Allergens: ... · Diet: ... · Other: ..." (empty parts omitted); the page-1 totals list per-allergen counts first, then preferences, then Other. Guests with a dietary entry are shown in bold with a heavier grey band, a "!" marker and a black bar in the margin (clear in black-and-white), and each table gets an extra "! Dietary: ..." band under its summary. There is no seat numbering (no seat data).
+
+### Compact layout and automatic orientation
+
+The plan is built to use as few pages as possible (it only goes to the kitchen): 10 mm margins, a
+single-line page header, 9 pt rows, and sections that **flow continuously** with no "fresh page"
+rules. Each table is a shaded sub-heading row followed by its guests and runner summary; a table may
+split across a page ("Table N (cont.)") and the column headers are repeated on every page. A
+heading, header row and first guest, or a summary band, is never left alone at the bottom or top of a
+page. Portrait and landscape are both laid out (with and without a column-header row per table) and the
+version with the **fewest pages** is used (a tie goes to portrait); `--plan-landscape` / the GUI
+"landscape" checkbox force landscape. The dish-by-table matrix is drawn whenever its table columns
+can be at least 8 mm wide; otherwise it is left out with a note. The dietary highlighting ("!", bold,
+grey band, black bar) and the allergy-marker key line are kept.
 
 ## Fonts
 
